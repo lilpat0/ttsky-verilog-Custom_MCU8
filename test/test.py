@@ -1,34 +1,30 @@
+```python
 import cocotb
 from cocotb.clock import Clock
-from cocotb.triggers import Timer, RisingEdge
+from cocotb.triggers import RisingEdge, Timer
 
 
 # ============================================================
-# CPU8 Cocotb Testbench
+# CPU8 Tiny Tapeout Cocotb Testbench
 #
-# UART:
-#   8-N-1
-#   115200 baud
+# 60 MHz CPU clock
+# UART: 115200 baud, 8-N-1
 #
-# Programming packet:
-#   AA
-#   address
-#   data
+# Programming protocol:
+#   AA <address> <data>
 #
 # Start command:
 #   55
-#
-# CPU clock:
-#   60 MHz
 # ============================================================
 
 
+CLK_PERIOD_NS = 16.666667
 BAUD = 115200
 BIT_TIME_NS = 1_000_000_000.0 / BAUD
 
 
 # ============================================================
-# Helpers
+# Utility functions
 # ============================================================
 
 async def wait_cycles(dut, cycles):
@@ -38,38 +34,42 @@ async def wait_cycles(dut, cycles):
 
 async def uart_send_byte(dut, data):
     """
-    Send one UART 8-N-1 byte on uio_in[0].
+    Send one byte through UART RX.
+
+    8-N-1:
+      start bit
+      8 data bits, LSB first
+      stop bit
     """
 
     # Start bit
-    dut.uio_in.value = int(dut.uio_in.value) | 0xFF
-    dut.uio_in.value &= ~0x01
+    dut.uio_in.value = dut.uio_in.value.integer | 0x01
+    dut.uio_in.value = dut.uio_in.value.integer & 0xFE
 
-    await Timer(BIT_TIME_NS, units="ns")
+    await Timer(BIT_TIME_NS, unit="ns")
 
-    # Data bits, LSB first
+    # Data bits
     for i in range(8):
-        value = int(dut.uio_in.value)
+        value = dut.uio_in.value.integer
 
         if (data >> i) & 1:
             value |= 0x01
         else:
-            value &= ~0x01
+            value &= 0xFE
 
         dut.uio_in.value = value
 
-        await Timer(BIT_TIME_NS, units="ns")
+        await Timer(BIT_TIME_NS, unit="ns")
 
-    # Stop bit
-    value = int(dut.uio_in.value) | 0x01
-    dut.uio_in.value = value
+    # Stop bit / idle high
+    dut.uio_in.value = dut.uio_in.value.integer | 0x01
 
-    await Timer(BIT_TIME_NS, units="ns")
+    await Timer(BIT_TIME_NS, unit="ns")
 
 
 async def program_instruction(dut, address, data):
     """
-    UART programming packet:
+    UART program packet:
 
         AA
         address
@@ -80,80 +80,58 @@ async def program_instruction(dut, address, data):
     await uart_send_byte(dut, address)
     await uart_send_byte(dut, data)
 
-    # Allow program write to propagate
     await wait_cycles(dut, 3)
 
 
 async def start_program(dut):
     """
-    Send UART 0x55 start command.
+    UART start command:
+
+        55
     """
 
     await uart_send_byte(dut, 0x55)
 
-    # Allow start pulse to propagate
     await wait_cycles(dut, 3)
 
 
 async def check_gpio(dut, expected, name):
-    await Timer(1, units="ns")
+    await Timer(1, unit="ns")
 
-    actual = int(dut.uo_out.value)
+    actual = int(dut.uo_out.value) & 0xFF
 
     if actual == expected:
         dut._log.info(
-            "PASSED: %s GPIO_OUT=%02X",
-            name,
-            actual
+            f"PASSED: {name} GPIO_OUT={actual:02x}"
         )
     else:
         raise AssertionError(
-            f"FAILED: {name} expected GPIO={expected:02X} "
-            f"got={actual:02X}"
+            f"FAILED: {name} expected GPIO={expected:02x} "
+            f"got={actual:02x}"
         )
-
-
-async def program(dut, instructions):
-    """
-    Program a list of (address, instruction) tuples.
-    """
-
-    for address, instruction in instructions:
-        await program_instruction(
-            dut,
-            address,
-            instruction
-        )
-
-
-async def run_program(dut, instructions, cycles):
-    """
-    Program CPU, start it, and wait.
-    """
-
-    await program(dut, instructions)
-    await start_program(dut)
-    await wait_cycles(dut, cycles)
 
 
 # ============================================================
-# Main test
+# Test
 # ============================================================
 
 @cocotb.test()
 async def test_cpu8(dut):
 
-    dut._log.info("")
     dut._log.info("================================================")
-    dut._log.info("       CPU8 TINY TAPEOUT COCOB TEST")
+    dut._log.info("       CPU8 TINY TAPEOUT COCOBT TEST")
     dut._log.info("================================================")
 
     # ========================================================
-    # Start 60 MHz clock
+    # Start clock
     # ========================================================
 
     cocotb.start_soon(
-        Clock(dut.clk, 16.6666666667, units="ns").start()
+        Clock(
+            dut.clk,
+            CLK_PERIOD_NS,
+            unit="ns"
+        ).start()
     )
 
     # ========================================================
@@ -198,17 +176,14 @@ async def test_cpu8(dut):
 
     await wait_cycles(dut, 20)
 
-    actual = int(dut.uo_out.value)
+    actual = int(dut.uo_out.value) & 0xFF
 
-    if actual == 0:
-        dut._log.info(
-            "PASSED: ena=0 keeps GPIO inactive"
+    if actual != 0x00:
+        raise AssertionError(
+            f"ena=0 expected GPIO=00 got={actual:02x}"
         )
-    else:
-        dut._log.info(
-            "INFO: ena=0 GPIO_OUT=%02X",
-            actual
-        )
+
+    dut._log.info("PASSED: ena=0 keeps GPIO inactive")
 
     # ========================================================
     # TEST 3: ENABLE CPU
@@ -227,9 +202,7 @@ async def test_cpu8(dut):
     dut.rst_n.value = 1
     await wait_cycles(dut, 10)
 
-    dut._log.info(
-        "PASSED: CPU enabled and reset released"
-    )
+    dut._log.info("PASSED: CPU enabled and reset released")
 
     # ========================================================
     # TEST 4: UART PROGRAMMING
@@ -240,17 +213,15 @@ async def test_cpu8(dut):
     dut._log.info("TEST 4: UART PROGRAMMING")
     dut._log.info("================================")
 
-    await run_program(
-        dut,
-        [
-            (0x00, 0x1F),
-            (0x01, 0xBD),
-            (0x02, 0x15),
-            (0x03, 0xBC),
-            (0x04, 0xC2),
-        ],
-        10
-    )
+    await program_instruction(dut, 0x00, 0x1F)
+    await program_instruction(dut, 0x01, 0xBD)
+    await program_instruction(dut, 0x02, 0x15)
+    await program_instruction(dut, 0x03, 0xBC)
+    await program_instruction(dut, 0x04, 0xC2)
+
+    await start_program(dut)
+
+    await wait_cycles(dut, 10)
 
     dut._log.info(
         "PASSED: UART program transmitted and CPU started"
@@ -265,17 +236,14 @@ async def test_cpu8(dut):
     dut._log.info("TEST 5: LDI")
     dut._log.info("================================")
 
-    await run_program(
-        dut,
-        [
-            (0x00, 0x1F),
-            (0x01, 0xBD),
-            (0x02, 0x1A),
-            (0x03, 0xBC),
-            (0x04, 0xC2),
-        ],
-        10
-    )
+    await program_instruction(dut, 0x00, 0x1F)
+    await program_instruction(dut, 0x01, 0xBD)
+    await program_instruction(dut, 0x02, 0x1A)
+    await program_instruction(dut, 0x03, 0xBC)
+    await program_instruction(dut, 0x04, 0xC2)
+
+    await start_program(dut)
+    await wait_cycles(dut, 10)
 
     await check_gpio(dut, 0x0A, "LDI")
 
@@ -288,16 +256,13 @@ async def test_cpu8(dut):
     dut._log.info("TEST 6: NOP")
     dut._log.info("================================")
 
-    await run_program(
-        dut,
-        [
-            (0x00, 0x00),
-            (0x01, 0x13),
-            (0x02, 0xBC),
-            (0x03, 0xC2),
-        ],
-        10
-    )
+    await program_instruction(dut, 0x00, 0x00)
+    await program_instruction(dut, 0x01, 0x13)
+    await program_instruction(dut, 0x02, 0xBC)
+    await program_instruction(dut, 0x03, 0xC2)
+
+    await start_program(dut)
+    await wait_cycles(dut, 10)
 
     await check_gpio(dut, 0x03, "NOP")
 
@@ -310,16 +275,13 @@ async def test_cpu8(dut):
     dut._log.info("TEST 7: INC")
     dut._log.info("================================")
 
-    await run_program(
-        dut,
-        [
-            (0x00, 0x15),
-            (0x01, 0x80),
-            (0x02, 0xBC),
-            (0x03, 0xC2),
-        ],
-        10
-    )
+    await program_instruction(dut, 0x00, 0x15)
+    await program_instruction(dut, 0x01, 0x80)
+    await program_instruction(dut, 0x02, 0xBC)
+    await program_instruction(dut, 0x03, 0xC2)
+
+    await start_program(dut)
+    await wait_cycles(dut, 10)
 
     await check_gpio(dut, 0x06, "INC")
 
@@ -332,16 +294,13 @@ async def test_cpu8(dut):
     dut._log.info("TEST 8: DEC")
     dut._log.info("================================")
 
-    await run_program(
-        dut,
-        [
-            (0x00, 0x15),
-            (0x01, 0x90),
-            (0x02, 0xBC),
-            (0x03, 0xC2),
-        ],
-        10
-    )
+    await program_instruction(dut, 0x00, 0x15)
+    await program_instruction(dut, 0x01, 0x90)
+    await program_instruction(dut, 0x02, 0xBC)
+    await program_instruction(dut, 0x03, 0xC2)
+
+    await start_program(dut)
+    await wait_cycles(dut, 10)
 
     await check_gpio(dut, 0x04, "DEC")
 
@@ -354,16 +313,13 @@ async def test_cpu8(dut):
     dut._log.info("TEST 9: NOT")
     dut._log.info("================================")
 
-    await run_program(
-        dut,
-        [
-            (0x00, 0x15),
-            (0x01, 0x70),
-            (0x02, 0xBC),
-            (0x03, 0xC2),
-        ],
-        10
-    )
+    await program_instruction(dut, 0x00, 0x15)
+    await program_instruction(dut, 0x01, 0x70)
+    await program_instruction(dut, 0x02, 0xBC)
+    await program_instruction(dut, 0x03, 0xC2)
+
+    await start_program(dut)
+    await wait_cycles(dut, 10)
 
     await check_gpio(dut, 0xFA, "NOT")
 
@@ -376,16 +332,13 @@ async def test_cpu8(dut):
     dut._log.info("TEST 10: ADD")
     dut._log.info("================================")
 
-    await run_program(
-        dut,
-        [
-            (0x00, 0x13),
-            (0x01, 0x23),
-            (0x02, 0xBC),
-            (0x03, 0xC2),
-        ],
-        10
-    )
+    await program_instruction(dut, 0x00, 0x13)
+    await program_instruction(dut, 0x01, 0x23)
+    await program_instruction(dut, 0x02, 0xBC)
+    await program_instruction(dut, 0x03, 0xC2)
+
+    await start_program(dut)
+    await wait_cycles(dut, 10)
 
     await check_gpio(dut, 0x06, "ADD")
 
@@ -398,16 +351,13 @@ async def test_cpu8(dut):
     dut._log.info("TEST 11: SUB")
     dut._log.info("================================")
 
-    await run_program(
-        dut,
-        [
-            (0x00, 0x15),
-            (0x01, 0x33),
-            (0x02, 0xBC),
-            (0x03, 0xC2),
-        ],
-        10
-    )
+    await program_instruction(dut, 0x00, 0x15)
+    await program_instruction(dut, 0x01, 0x33)
+    await program_instruction(dut, 0x02, 0xBC)
+    await program_instruction(dut, 0x03, 0xC2)
+
+    await start_program(dut)
+    await wait_cycles(dut, 10)
 
     await check_gpio(dut, 0x02, "SUB")
 
@@ -420,32 +370,25 @@ async def test_cpu8(dut):
     dut._log.info("TEST 12: AND")
     dut._log.info("================================")
 
-    await run_program(
-        dut,
-        [
-            (0x00, 0x1A),
-            (0x01, 0x4F),
-            (0x02, 0xBC),
-            (0x03, 0xC2),
-        ],
-        10
-    )
+    await program_instruction(dut, 0x00, 0x1A)
+    await program_instruction(dut, 0x01, 0x4F)
+    await program_instruction(dut, 0x02, 0xBC)
+    await program_instruction(dut, 0x03, 0xC2)
+
+    await start_program(dut)
+    await wait_cycles(dut, 10)
 
     await check_gpio(dut, 0x0A, "AND")
 
     # ========================================================
     # TEST 13: OR
     #
-    # IMPORTANT:
+    # Correct test:
     #
-    # Operand is only 4 bits.
+    #   LDI 5
+    #   OR  A
     #
-    # 0x15 = LDI 5
-    # 0x5A = OR  A
-    #
-    # Therefore:
-    #
-    # 0x05 | 0x0A = 0x0F
+    #   0x05 | 0x0A = 0x0F
     # ========================================================
 
     dut._log.info("")
@@ -453,16 +396,13 @@ async def test_cpu8(dut):
     dut._log.info("TEST 13: OR")
     dut._log.info("================================")
 
-    await run_program(
-        dut,
-        [
-            (0x00, 0x15),
-            (0x01, 0x5A),
-            (0x02, 0xBC),
-            (0x03, 0xC2),
-        ],
-        10
-    )
+    await program_instruction(dut, 0x00, 0x15)
+    await program_instruction(dut, 0x01, 0x5A)
+    await program_instruction(dut, 0x02, 0xBC)
+    await program_instruction(dut, 0x03, 0xC2)
+
+    await start_program(dut)
+    await wait_cycles(dut, 10)
 
     await check_gpio(dut, 0x0F, "OR")
 
@@ -475,16 +415,13 @@ async def test_cpu8(dut):
     dut._log.info("TEST 14: XOR")
     dut._log.info("================================")
 
-    await run_program(
-        dut,
-        [
-            (0x00, 0x1A),
-            (0x01, 0x65),
-            (0x02, 0xBC),
-            (0x03, 0xC2),
-        ],
-        10
-    )
+    await program_instruction(dut, 0x00, 0x1A)
+    await program_instruction(dut, 0x01, 0x65)
+    await program_instruction(dut, 0x02, 0xBC)
+    await program_instruction(dut, 0x03, 0xC2)
+
+    await start_program(dut)
+    await wait_cycles(dut, 10)
 
     await check_gpio(dut, 0x0F, "XOR")
 
@@ -497,18 +434,15 @@ async def test_cpu8(dut):
     dut._log.info("TEST 15: STORE / LOAD RAM")
     dut._log.info("================================")
 
-    await run_program(
-        dut,
-        [
-            (0x00, 0x1A),
-            (0x01, 0xB5),
-            (0x02, 0x10),
-            (0x03, 0xA5),
-            (0x04, 0xBC),
-            (0x05, 0xC2),
-        ],
-        15
-    )
+    await program_instruction(dut, 0x00, 0x1A)
+    await program_instruction(dut, 0x01, 0xB5)
+    await program_instruction(dut, 0x02, 0x10)
+    await program_instruction(dut, 0x03, 0xA5)
+    await program_instruction(dut, 0x04, 0xBC)
+    await program_instruction(dut, 0x05, 0xC2)
+
+    await start_program(dut)
+    await wait_cycles(dut, 15)
 
     await check_gpio(dut, 0x0A, "RAM LOAD")
 
@@ -521,19 +455,14 @@ async def test_cpu8(dut):
     dut._log.info("TEST 16: GPIO OUTPUT")
     dut._log.info("================================")
 
-    gpio_values = [0x00, 0x05, 0x0A, 0x0F]
+    for value in [0x00, 0x05, 0x0A, 0x0F]:
 
-    for value in gpio_values:
+        await program_instruction(dut, 0x00, 0x10 | value)
+        await program_instruction(dut, 0x01, 0xBC)
+        await program_instruction(dut, 0x02, 0xC2)
 
-        await run_program(
-            dut,
-            [
-                (0x00, 0x10 | value),
-                (0x01, 0xBC),
-                (0x02, 0xC2),
-            ],
-            8
-        )
+        await start_program(dut)
+        await wait_cycles(dut, 8)
 
         await check_gpio(
             dut,
@@ -550,19 +479,12 @@ async def test_cpu8(dut):
     dut._log.info("TEST 17: GPIO INPUT")
     dut._log.info("================================")
 
-    await run_program(
-        dut,
-        [
-            (0x00, 0xAE),
-            (0x01, 0xBC),
-            (0x02, 0xC2),
-        ],
-        8
-    )
+    await program_instruction(dut, 0x00, 0xAE)
+    await program_instruction(dut, 0x01, 0xBC)
+    await program_instruction(dut, 0x02, 0xC2)
 
     dut.ui_in.value = 0xA5
 
-    # Restart program with new GPIO input
     await start_program(dut)
     await wait_cycles(dut, 8)
 
@@ -592,19 +514,16 @@ async def test_cpu8(dut):
     dut._log.info("TEST 18: JMP")
     dut._log.info("================================")
 
-    await run_program(
-        dut,
-        [
-            (0x00, 0x11),
-            (0x01, 0xC4),
-            (0x02, 0x12),
-            (0x03, 0xBC),
-            (0x04, 0x13),
-            (0x05, 0xBC),
-            (0x06, 0xC6),
-        ],
-        12
-    )
+    await program_instruction(dut, 0x00, 0x11)
+    await program_instruction(dut, 0x01, 0xC4)
+    await program_instruction(dut, 0x02, 0x12)
+    await program_instruction(dut, 0x03, 0xBC)
+    await program_instruction(dut, 0x04, 0x13)
+    await program_instruction(dut, 0x05, 0xBC)
+    await program_instruction(dut, 0x06, 0xC6)
+
+    await start_program(dut)
+    await wait_cycles(dut, 12)
 
     await check_gpio(dut, 0x03, "JMP")
 
@@ -617,19 +536,16 @@ async def test_cpu8(dut):
     dut._log.info("TEST 19: BZ TAKEN")
     dut._log.info("================================")
 
-    await run_program(
-        dut,
-        [
-            (0x00, 0x10),
-            (0x01, 0xD4),
-            (0x02, 0x11),
-            (0x03, 0xBC),
-            (0x04, 0x12),
-            (0x05, 0xBC),
-            (0x06, 0xC6),
-        ],
-        12
-    )
+    await program_instruction(dut, 0x00, 0x10)
+    await program_instruction(dut, 0x01, 0xD4)
+    await program_instruction(dut, 0x02, 0x11)
+    await program_instruction(dut, 0x03, 0xBC)
+    await program_instruction(dut, 0x04, 0x12)
+    await program_instruction(dut, 0x05, 0xBC)
+    await program_instruction(dut, 0x06, 0xC6)
+
+    await start_program(dut)
+    await wait_cycles(dut, 12)
 
     await check_gpio(dut, 0x02, "BZ TAKEN")
 
@@ -642,19 +558,16 @@ async def test_cpu8(dut):
     dut._log.info("TEST 20: BZ NOT TAKEN")
     dut._log.info("================================")
 
-    await run_program(
-        dut,
-        [
-            (0x00, 0x11),
-            (0x01, 0xD4),
-            (0x02, 0x12),
-            (0x03, 0xBC),
-            (0x04, 0x13),
-            (0x05, 0xBC),
-            (0x06, 0xC6),
-        ],
-        12
-    )
+    await program_instruction(dut, 0x00, 0x11)
+    await program_instruction(dut, 0x01, 0xD4)
+    await program_instruction(dut, 0x02, 0x12)
+    await program_instruction(dut, 0x03, 0xBC)
+    await program_instruction(dut, 0x04, 0x13)
+    await program_instruction(dut, 0x05, 0xBC)
+    await program_instruction(dut, 0x06, 0xC6)
+
+    await start_program(dut)
+    await wait_cycles(dut, 12)
 
     await check_gpio(dut, 0x03, "BZ NOT TAKEN")
 
@@ -667,19 +580,16 @@ async def test_cpu8(dut):
     dut._log.info("TEST 21: BNZ TAKEN")
     dut._log.info("================================")
 
-    await run_program(
-        dut,
-        [
-            (0x00, 0x11),
-            (0x01, 0xE4),
-            (0x02, 0x12),
-            (0x03, 0xBC),
-            (0x04, 0x13),
-            (0x05, 0xBC),
-            (0x06, 0xC6),
-        ],
-        12
-    )
+    await program_instruction(dut, 0x00, 0x11)
+    await program_instruction(dut, 0x01, 0xE4)
+    await program_instruction(dut, 0x02, 0x12)
+    await program_instruction(dut, 0x03, 0xBC)
+    await program_instruction(dut, 0x04, 0x13)
+    await program_instruction(dut, 0x05, 0xBC)
+    await program_instruction(dut, 0x06, 0xC6)
+
+    await start_program(dut)
+    await wait_cycles(dut, 12)
 
     await check_gpio(dut, 0x03, "BNZ TAKEN")
 
@@ -692,19 +602,16 @@ async def test_cpu8(dut):
     dut._log.info("TEST 22: BNZ NOT TAKEN")
     dut._log.info("================================")
 
-    await run_program(
-        dut,
-        [
-            (0x00, 0x10),
-            (0x01, 0xE4),
-            (0x02, 0x12),
-            (0x03, 0xBC),
-            (0x04, 0x13),
-            (0x05, 0xBC),
-            (0x06, 0xC6),
-        ],
-        12
-    )
+    await program_instruction(dut, 0x00, 0x10)
+    await program_instruction(dut, 0x01, 0xE4)
+    await program_instruction(dut, 0x02, 0x12)
+    await program_instruction(dut, 0x03, 0xBC)
+    await program_instruction(dut, 0x04, 0x13)
+    await program_instruction(dut, 0x05, 0xBC)
+    await program_instruction(dut, 0x06, 0xC6)
+
+    await start_program(dut)
+    await wait_cycles(dut, 12)
 
     await check_gpio(dut, 0x03, "BNZ NOT TAKEN")
 
@@ -717,18 +624,15 @@ async def test_cpu8(dut):
     dut._log.info("TEST 23: HALT")
     dut._log.info("================================")
 
-    await run_program(
-        dut,
-        [
-            (0x00, 0x15),
-            (0x01, 0xBC),
-            (0x02, 0xF0),
-            (0x03, 0x1A),
-            (0x04, 0xBC),
-            (0x05, 0xC5),
-        ],
-        10
-    )
+    await program_instruction(dut, 0x00, 0x15)
+    await program_instruction(dut, 0x01, 0xBC)
+    await program_instruction(dut, 0x02, 0xF0)
+    await program_instruction(dut, 0x03, 0x1A)
+    await program_instruction(dut, 0x04, 0xBC)
+    await program_instruction(dut, 0x05, 0xC5)
+
+    await start_program(dut)
+    await wait_cycles(dut, 10)
 
     await check_gpio(dut, 0x05, "HALT")
 
@@ -741,17 +645,14 @@ async def test_cpu8(dut):
     dut._log.info("TEST 24: RESET WHILE RUNNING")
     dut._log.info("================================")
 
-    await run_program(
-        dut,
-        [
-            (0x00, 0x11),
-            (0x01, 0xBC),
-            (0x02, 0x10),
-            (0x03, 0xBC),
-            (0x04, 0xC2),
-        ],
-        10
-    )
+    await program_instruction(dut, 0x00, 0x11)
+    await program_instruction(dut, 0x01, 0xBC)
+    await program_instruction(dut, 0x02, 0x10)
+    await program_instruction(dut, 0x03, 0xBC)
+    await program_instruction(dut, 0x04, 0xC2)
+
+    await start_program(dut)
+    await wait_cycles(dut, 10)
 
     dut.rst_n.value = 0
 
@@ -767,9 +668,7 @@ async def test_cpu8(dut):
 
     await wait_cycles(dut, 5)
 
-    dut._log.info(
-        "PASSED: CPU recovered after reset"
-    )
+    dut._log.info("PASSED: CPU recovered after reset")
 
     # ========================================================
     # TEST 25: UART REPROGRAMMING
@@ -780,15 +679,12 @@ async def test_cpu8(dut):
     dut._log.info("TEST 25: UART REPROGRAMMING")
     dut._log.info("================================")
 
-    await run_program(
-        dut,
-        [
-            (0x00, 0x17),
-            (0x01, 0xBC),
-            (0x02, 0xC2),
-        ],
-        10
-    )
+    await program_instruction(dut, 0x00, 0x17)
+    await program_instruction(dut, 0x01, 0xBC)
+    await program_instruction(dut, 0x02, 0xC2)
+
+    await start_program(dut)
+    await wait_cycles(dut, 10)
 
     await check_gpio(
         dut,
@@ -805,30 +701,11 @@ async def test_cpu8(dut):
     dut._log.info("TEST 26: UART MULTIPLE WRITES")
     dut._log.info("================================")
 
-    multiple_program = [
-        0x11,
-        0x12,
-        0x13,
-        0x14,
-        0x15,
-        0x16,
-        0x17,
-        0x18,
-        0x19,
-        0x1A,
-        0x1B,
-        0x1C,
-        0x1D,
-        0x1E,
-        0x1F,
-        0x00,
-    ]
-
-    for address, instruction in enumerate(multiple_program):
+    for address in range(16):
         await program_instruction(
             dut,
             address,
-            instruction
+            0x10 + address
         )
 
     dut._log.info(
@@ -846,15 +723,26 @@ async def test_cpu8(dut):
 
     for value in [0x00, 0x01, 0x05, 0x0A, 0x0F]:
 
-        await run_program(
+        await program_instruction(
             dut,
-            [
-                (0x00, 0x10 | value),
-                (0x01, 0xBC),
-                (0x02, 0xC2),
-            ],
-            8
+            0x00,
+            0x10 | value
         )
+
+        await program_instruction(
+            dut,
+            0x01,
+            0xBC
+        )
+
+        await program_instruction(
+            dut,
+            0x02,
+            0xC2
+        )
+
+        await start_program(dut)
+        await wait_cycles(dut, 8)
 
         await check_gpio(
             dut,
@@ -872,4 +760,5 @@ async def test_cpu8(dut):
     dut._log.info("================================================")
 
     dut._log.info("")
-    dut._log.info("All 27 CPU8 tests passed.")
+    dut._log.info("All CPU8 tests passed.")
+```
