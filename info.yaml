@@ -21,7 +21,7 @@ project:
     - "instruction_memory8.sv"
     - "gpio8.sv"
     - "pc8.sv"
-    - "uart8.sv"
+    - "uart_programmer8.sv"
     - "cpu8.sv"
     - "tt_um_cpu8.sv"
 
