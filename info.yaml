@@ -23,7 +23,7 @@ project:
     - "pc8.sv"
     - "uart_programmer8.sv"
     - "cpu_top8.sv"
-    - "tt_um_mpu8.sv"
+    - "tt_um_mcu8.sv"
 
 # Pinout
 pinout:
