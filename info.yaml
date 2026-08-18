@@ -8,7 +8,7 @@ project:
   clock_hz:     60000000
 
   # Single Tiny Tapeout tile
-  tiles: "1x1"
+  tiles: "2x2"
 
   # Top module
   top_module:  "tt_um_cpu8"
@@ -22,7 +22,7 @@ project:
     - "gpio8.sv"
     - "pc8.sv"
     - "uart_programmer8.sv"
-    - "cpu8.sv"
+    - "cpu_top8.sv"
     - "tt_um_cpu8.sv"
 
 # Pinout
