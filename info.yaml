@@ -1,4 +1,3 @@
-```yaml
 # Tiny Tapeout project information
 project:
   title:        "CPU8"
@@ -60,4 +59,3 @@ pinout:
 
 # Do not change!
 yaml_version: 6
-```
