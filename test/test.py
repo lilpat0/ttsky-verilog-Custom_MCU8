@@ -1,4 +1,3 @@
-```python
 import cocotb
 from cocotb.clock import Clock
 from cocotb.triggers import RisingEdge, Timer
@@ -761,4 +760,3 @@ async def test_cpu8(dut):
 
     dut._log.info("")
     dut._log.info("All CPU8 tests passed.")
-```
