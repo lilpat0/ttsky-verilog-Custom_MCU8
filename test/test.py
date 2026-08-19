@@ -32,13 +32,26 @@ ISA notes that shape what's testable (see decode8.sv / cpu_top8.sv):
   - STORE/LOAD addresses and JMP/BZ/BNZ targets are literal 4-bit values
     baked into the instruction (no indirect/computed addressing), so they
     only ever reach addresses 0-15 of instruction memory / RAM.
-  - LOAD only special-cases operand 0xE (GPIO input); operand 0xC/0xD on a
-    LOAD fall through to a plain RAM read at that address. Since STORE
-    *does* special-case 0xC/0xD (GPIO output/direction) and therefore
-    never writes RAM there, "LOAD 0xC"/"LOAD 0xD" will always read back 0,
-    not whatever was last STOREd to GPIO. This is exercised explicitly
-    below (test_load_gpio_addr_reads_ram_not_gpio) rather than "fixed",
-    since it's the real, observable behaviour of the given RTL.
+  - LOAD only special-cases operands 0xD and 0xE. STORE only special-
+    cases 0xC and 0xD. Everything else (including plain LOAD/STORE 0xC)
+    is a normal RAM access. Specifically:
+      * STORE 0xC / LOAD 0xE -> ui_in/uo_out GPIO word (gpio8.sv).
+      * STORE 0xD / LOAD 0xD -> the fixed-direction uio port (4 general-
+        purpose outputs on uio[7:4], 3 general-purpose inputs on
+        uio[3:1] -- uio[0] is hardwired to UART RX and is never exposed
+        to software). Direction on this port is fixed in hardware, not
+        software-configurable -- there used to be a software direction
+        register at this address, but it's been replaced.
+      * LOAD 0xC falls through to a plain RAM read. Since STORE *does*
+        special-case 0xC (routes to GPIO output, never RAM), that RAM
+        location can never actually be written by any program -- LOAD
+        0xC always reads back whatever RAM happened to power up with,
+        which is 0 in behavioral RTL sim (Icarus zero-initializes regs)
+        but is genuinely undefined (X) on a gate-level netlist / real
+        silicon, since RAM has no reset. test_load_gpio_addr_reads_ram
+        below is written to only assert the *isolation* property (LOAD
+        0xC doesn't mirror gpio_out) rather than any specific value, so
+        it holds on both behavioral and gate-level sims.
   - Instruction memory (instruction_memory8.sv) is not cleared by rst_n,
     only by the power-on `initial` block, so it retains whatever the
     UART programmer last wrote across resets/tests. Every test below
@@ -71,9 +84,9 @@ from cocotb.triggers import ClockCycles
 PHYSICAL_PINS = (
     "ui_in",    # [7:0] input
     "uo_out",   # [7:0] output
-    "uio_in",   # [7:0] input  (bit 0 = UART RX)
-    "uio_out",  # [7:0] output (tied 0 in this design)
-    "uio_oe",   # [7:0] output (tied 0 in this design)
+    "uio_in",   # [7:0] input  (bit 0 = UART RX, bits 1-3 = general input)
+    "uio_out",  # [7:0] output (bits 7-4 = general output, bits 3-0 = 0)
+    "uio_oe",   # [7:0] output (fixed 0xF0: 7-4 out, 3-0 in)
     "ena",      # input
     "clk",      # input
     "rst_n",    # input
@@ -113,9 +126,9 @@ OP_BNZ = 0xE
 OP_HALT = 0xF
 
 # Memory-mapped GPIO "addresses" used as the 4-bit operand of LOAD/STORE.
-GPIO_OUT_ADDR = 0xC
-GPIO_DIR_ADDR = 0xD
-GPIO_IN_ADDR = 0xE
+GPIO_OUT_ADDR = 0xC   # STORE only -> ui_in/uo_out GPIO word (gpio8.sv)
+UIO_ADDR = 0xD        # STORE/LOAD -> fixed-direction uio port (4 out / 3 in)
+GPIO_IN_ADDR = 0xE    # LOAD only  -> ui_in/uo_out GPIO word (gpio8.sv)
 
 
 def enc(opcode, operand):
@@ -142,9 +155,13 @@ class UartProgrammer:
         self.dut = dut
 
     def _drive_rx(self, bit):
-        # Only uio_in[0] is used by the design (UART RX); keep the other
-        # bits at 0 since nothing else in this design consumes them.
-        self.dut.uio_in.value = bit & 0x1
+        # Only uio_in[0] is the UART RX line. Preserve whatever the test
+        # currently has driven on uio_in[7:1] (e.g. fixed-input GPIO test
+        # values) — a naive `self.dut.uio_in.value = bit` here would
+        # clobber those bits on every single UART bit transmitted, since
+        # every program/start_cpu call drives many bits in a row.
+        current = int(self.dut.uio_in.value)
+        self.dut.uio_in.value = (current & 0xFE) | (bit & 0x1)
 
     async def _send_bit(self, bit):
         self._drive_rx(bit)
@@ -186,7 +203,7 @@ async def reset_dut(dut, clk_period_ns=10):
 
     dut.ena.value = 1
     dut.ui_in.value = 0
-    dut.uio_in.value = 1  # UART idle = high
+    dut.uio_in.value = 1  # UART idle = high (bit 0); other bits 0
 
     dut.rst_n.value = 0
     await ClockCycles(dut.clk, 10)
@@ -215,6 +232,17 @@ async def wait_for_halt(dut, timeout_cycles=2000):
     await ClockCycles(dut.clk, timeout_cycles)
 
 
+def set_uio_general_inputs(dut, bits3to1):
+    """Drive uio_in[3:1] (the fixed general-purpose inputs) to the given
+    3-bit value, while keeping uio_in[0] (UART RX) idle-high. Must be
+    called AFTER reset_dut(), which forces uio_in back to its idle state
+    (bit 0 = 1, all other bits = 0) as part of establishing a known reset
+    condition."""
+    assert 0 <= bits3to1 <= 0x7
+    current = int(dut.uio_in.value)
+    dut.uio_in.value = (current & 0b1) | (bits3to1 << 1) | 0b1  # keep bit0=1 (idle)
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -225,8 +253,11 @@ async def test_reset_state(dut):
     await reset_dut(dut)
 
     assert dut.uo_out.value == 0, "uo_out should be 0 out of reset"
-    assert dut.uio_out.value == 0, "uio_out is tied to 0 in this design"
-    assert dut.uio_oe.value == 0, "uio_oe is tied to 0 in this design"
+    assert dut.uio_oe.value == 0xF0, (
+        "uio_oe should reflect the fixed 4-out/4-in split at all times "
+        f"(hardwired, not reset-dependent); got {int(dut.uio_oe.value):#04x}"
+    )
+    assert (int(dut.uio_out.value) >> 4) == 0, "uio general outputs should be 0 out of reset"
 
 
 @cocotb.test()
@@ -491,7 +522,7 @@ async def test_ram_address_sweep(dut):
     """Store a distinct value at every addressable RAM location (every
     4-bit operand except the GPIO-mapped 0xC/0xD/0xE) and read each back
     to make sure there's no address aliasing."""
-    ram_addrs = [a for a in range(16) if a not in (GPIO_OUT_ADDR, GPIO_DIR_ADDR, GPIO_IN_ADDR)]
+    ram_addrs = [a for a in range(16) if a not in (GPIO_OUT_ADDR, UIO_ADDR, GPIO_IN_ADDR)]
 
     for addr in ram_addrs:
         value = (addr * 7 + 3) & 0xFF & 0xF  # keep it representable via LDI (4-bit immediate)
@@ -513,59 +544,121 @@ async def test_ram_address_sweep(dut):
 
 @cocotb.test()
 async def test_load_gpio_addr_reads_ram_not_gpio(dut):
-    """LOAD only special-cases operand 0xE. STORE 0xC/0xD never touch RAM
-    (they go to the GPIO output/direction registers instead), so LOAD
-    0xC / LOAD 0xD read back RAM addresses that were never written -> 0.
-    This documents real RTL behaviour, not an "intended" readback path.
+    """LOAD 0xC is not special-cased (only 0xD and 0xE are), so it falls
+    through to a plain RAM read. Since STORE *does* special-case 0xC
+    (routes to the GPIO output register, never RAM), that RAM location can
+    never actually be written by any program -- there is no way to give it
+    a known value through the ISA.
+
+    In behavioral RTL sim, Icarus happens to zero-initialize uninitialized
+    regs, so that location reads back a stable 0. On a gate-level netlist
+    / real silicon, RAM has no reset and an unwritten location powers up
+    to a genuinely unknown (X) value -- asserting any specific number
+    there isn't a valid hardware expectation, and int()-ing an X value
+    raises rather than comparing false.
+
+    What's actually worth verifying, and what DOES hold on real hardware:
+    LOAD 0xC is decoupled from the GPIO output register -- it reads back
+    the same thing regardless of what was just STOREd to GPIO_OUT_ADDR, so
+    it isn't secretly mirroring gpio_out.
     """
+
+    def make_program(gpio_value):
+        return [
+            enc(OP_LDI, gpio_value),
+            enc(OP_STORE, GPIO_OUT_ADDR),  # gpio_out = gpio_value
+            enc(OP_LDI, 0xF),               # poison the accumulator
+            enc(OP_LOAD, GPIO_OUT_ADDR),     # actually reads RAM[0xC], never written
+            enc(OP_STORE, 0x1),              # RAM[1] = whatever that read gave
+            enc(OP_LDI, 0),
+            enc(OP_LOAD, 0x1),
+            enc(OP_STORE, GPIO_OUT_ADDR),     # push it back out so we can observe it
+            enc(OP_HALT, 0),
+        ]
+
     uart = await reset_dut(dut)
-
-    program = [
-        enc(OP_LDI, 0xA),
-        enc(OP_STORE, GPIO_OUT_ADDR),      # gpio output register = 0xA
-        enc(OP_LDI, 0xB),
-        enc(OP_STORE, GPIO_DIR_ADDR),      # gpio direction register = 0xB
-        enc(OP_LDI, 0xF),                  # poison the accumulator
-        enc(OP_LOAD, GPIO_OUT_ADDR),       # actually reads RAM[0xC] (never written) -> 0
-        enc(OP_STORE, 0x1),                # RAM[1] = 0
-        enc(OP_LDI, 0xF),                  # poison again
-        enc(OP_LOAD, GPIO_DIR_ADDR),       # actually reads RAM[0xD] (never written) -> 0
-        enc(OP_STORE, 0x2),                # RAM[2] = 0
-        enc(OP_LDI, 0),
-        enc(OP_LOAD, 0x1),
-        enc(OP_STORE, GPIO_OUT_ADDR),      # push RAM[1] out so we can observe it
-        enc(OP_HALT, 0),
-    ]
-    await run_program(dut, uart, program)
+    await run_program(dut, uart, make_program(0x5))
     await wait_for_halt(dut, timeout_cycles=80)
+    first_result = dut.uo_out.value
 
-    assert dut.uo_out.value == 0, (
-        f"LOAD 0xC should read RAM (never written -> 0), got {int(dut.uo_out.value)}"
+    uart = await reset_dut(dut)
+    await run_program(dut, uart, make_program(0xA))
+    await wait_for_halt(dut, timeout_cycles=80)
+    second_result = dut.uo_out.value
+
+    assert first_result == second_result, (
+        "LOAD 0xC should read a fixed RAM location, independent of "
+        "whatever value was just STOREd to the GPIO output register "
+        f"(0xC); got {first_result} after storing 0x5 vs "
+        f"{second_result} after storing 0xA"
     )
 
 
 @cocotb.test()
-async def test_gpio_direction_register_write_is_isolated(dut):
-    """STORE 0xD (direction register) must not corrupt the GPIO output
-    register / uo_out, and vice versa."""
+async def test_uio_store_isolated_from_gpio_out(dut):
+    """STORE 0xD (the fixed uio output port) must not corrupt the
+    dedicated GPIO output register / uo_out, and vice versa -- these are
+    two entirely separate registers/pins now."""
     uart = await reset_dut(dut)
 
     program = [
         enc(OP_LDI, 4),
         enc(OP_STORE, GPIO_OUT_ADDR),   # gpio_out = 4
         enc(OP_LDI, 0xF),
-        enc(OP_STORE, GPIO_DIR_ADDR),   # direction reg = 0xF, must not touch gpio_out
+        enc(OP_STORE, UIO_ADDR),        # uio general outputs = 0xF, must not touch gpio_out
         enc(OP_HALT, 0),
     ]
     await run_program(dut, uart, program)
     await wait_for_halt(dut, timeout_cycles=50)
 
     assert dut.uo_out.value == 4, (
-        f"STORE to direction register altered uo_out: got {int(dut.uo_out.value)}"
+        f"STORE to the uio port altered uo_out: got {int(dut.uo_out.value)}"
     )
-    # gpio_oe from cpu8 is left unconnected at the tt_um top level, so the
-    # direction register's effect isn't independently observable from the
-    # chip pins; we can only confirm it doesn't corrupt gpio_out.
+    assert (int(dut.uio_out.value) >> 4) == 0xF, (
+        f"STORE 0xD should drive uio_out[7:4]=0xF, got {int(dut.uio_out.value):#04x}"
+    )
+
+
+@cocotb.test()
+async def test_uio_fixed_io(dut):
+    """uio pins are fixed-direction in hardware (see tt_um_mcu8.sv):
+    uio[7:4] are always outputs, uio[3:0] are always inputs (uio[0] is
+    reserved for UART RX). STORE 0xD writes the 4 fixed-output bits;
+    LOAD 0xD reads the 3 general-purpose fixed-input bits (uio[3:1])."""
+    uart = await reset_dut(dut)
+
+    assert dut.uio_oe.value == 0xF0, (
+        f"expected uio_oe=0xF0 (fixed split), got {int(dut.uio_oe.value):#04x}"
+    )
+
+    # ---- STORE 0xD -> uio_out[7:4] ----
+    program = [
+        enc(OP_LDI, 0xB),
+        enc(OP_STORE, UIO_ADDR),
+        enc(OP_HALT, 0),
+    ]
+    await run_program(dut, uart, program)
+    await wait_for_halt(dut, timeout_cycles=50)
+
+    assert (int(dut.uio_out.value) >> 4) == 0xB, (
+        f"expected uio_out[7:4]=0xB, got {int(dut.uio_out.value):#04x}"
+    )
+
+    # ---- LOAD 0xD -> uio_in[3:1] ----
+    uart = await reset_dut(dut)
+    set_uio_general_inputs(dut, 0b101)  # uio_in[3:1] = 1,0,1
+
+    program = [
+        enc(OP_LOAD, UIO_ADDR),
+        enc(OP_STORE, GPIO_OUT_ADDR),
+        enc(OP_HALT, 0),
+    ]
+    await run_program(dut, uart, program)
+    await wait_for_halt(dut, timeout_cycles=50)
+
+    assert dut.uo_out.value == 0b101, (
+        f"expected uo_out=0b101 (uio_in[3:1]), got {int(dut.uo_out.value):#04x}"
+    )
 
 
 @cocotb.test()
