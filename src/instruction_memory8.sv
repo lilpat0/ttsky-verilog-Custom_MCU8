@@ -1,5 +1,5 @@
 module instruction_memory8 #(
-    parameter integer DEPTH = 256
+    parameter integer DEPTH = 64
 )(
     input logic clk,
 
