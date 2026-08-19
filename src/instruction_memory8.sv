@@ -1,62 +1,38 @@
 module instruction_memory8 #(
     parameter integer DEPTH = 32
 )(
-    input logic clk,
+    input  logic       clk,
 
-    // CPU fetch
-    input logic [7:0] pc,
+    input  logic [7:0] pc,
     output logic [7:0] instruction,
 
-    // Programming interface
-    input logic       we,
-    input logic [7:0] prog_adress,
-    input logic [7:0] prog_data
+    input  logic       we,
+    input  logic [7:0] prog_adress,
+    input  logic [7:0] prog_data
 );
 
     logic [7:0] instructions [0:DEPTH-1];
 
     integer i;
 
-    // =========================================================
-    // Initialize memory to NOP
-    // =========================================================
-
+    // Simulation initialization
     initial begin
-
-        for (i = 0; i < DEPTH; i = i + 1) begin
-
+        for (i = 0; i < DEPTH; i = i + 1)
             instructions[i] = 8'h00;
-
-        end
-
     end
 
-    // =========================================================
-    // Programming write port
-    // =========================================================
-
+    // Program write
     always_ff @(posedge clk) begin
-
-        if (we) begin
-
-            if (prog_adress < DEPTH) begin
-
-                instructions[prog_adress] <= prog_data;
-
-            end
-
-        end
-
+        if (we && (prog_adress < DEPTH))
+            instructions[prog_adress] <= prog_data;
     end
 
-    // =========================================================
     // Instruction fetch
-    // =========================================================
-
     always_comb begin
-
-        instruction = instructions[pc];
-
+        if (pc < DEPTH)
+            instruction = instructions[pc];
+        else
+            instruction = 8'h00;
     end
 
 endmodule
