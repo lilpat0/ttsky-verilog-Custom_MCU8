@@ -132,7 +132,7 @@ module cpu8 (
     // =========================================================
 
     logic ram_we;
-    logic [4:0] ram_address;
+    logic [3:0] ram_address;
 
     logic [7:0] ram_write_data;
     logic [7:0] ram_read_data;
