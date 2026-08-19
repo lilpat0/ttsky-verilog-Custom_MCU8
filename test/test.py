@@ -132,6 +132,7 @@ def enc(opcode, operand):
 CLK_FREQ = 60_000_000
 BAUD_RATE = 115200
 CLKS_PER_BIT = CLK_FREQ // BAUD_RATE  # matches localparam in uart_programmer8.sv
+CLKS_PER_BYTE = CLKS_PER_BIT * 10     # start + 8 data + stop bits
 
 
 class UartProgrammer:
@@ -571,7 +572,13 @@ async def test_gpio_direction_register_write_is_isolated(dut):
 async def test_gpio_input_tracks_live_changes(dut):
     """GPIO input read is combinational/live (gpio8: read_data = gpio_in
     when re & address==INPUT); changing ui_in between two LOAD/STORE
-    passes should produce two different observed outputs."""
+    passes should produce two different observed outputs.
+
+    NOTE: reset_dut() unconditionally drives ui_in to 0 as part of its own
+    initialization (it has to start from a known state). That means any
+    ui_in value set *before* calling reset_dut() gets overwritten by it —
+    ui_in must be (re)applied *after* reset_dut() returns, not before.
+    """
     uart = await reset_dut(dut)
 
     program = [
@@ -585,8 +592,8 @@ async def test_gpio_input_tracks_live_changes(dut):
     await wait_for_halt(dut, timeout_cycles=50)
     assert dut.uo_out.value == 0x3C
 
-    dut.ui_in.value = 0xC3
     uart = await reset_dut(dut)
+    dut.ui_in.value = 0xC3  # set AFTER reset_dut(), which itself drives ui_in to 0
     await run_program(dut, uart, program)
     await wait_for_halt(dut, timeout_cycles=50)
     assert dut.uo_out.value == 0xC3
@@ -674,34 +681,110 @@ async def test_uart_reprogram_overwrites_instruction_memory(dut):
     )
 
 
+# ---------------------------------------------------------------------------
+# Long-running, interruptible program used by
+# test_start_cpu_restarts_mid_execution below.
+#
+# Why this exists: uart_programmer8's bit-banged UART protocol takes
+# CLKS_PER_BYTE (= 10 * CLKS_PER_BIT = 5200 cycles at 60MHz/115200) to
+# deliver a single byte. That means the earliest a *second* 0x55 start
+# byte can possibly be received is ~5200 cycles after the first one was
+# received — there is no way to "interrupt" a program any sooner than
+# that via this UART interface. A handful of LDI/NOP/STORE instructions
+# finish in single-digit cycle counts, so a short program is always long
+# finished (and the CPU sitting HALTed) by the time a second start byte
+# could arrive; testing "restart" against a short program only ever
+# exercises restart-after-natural-completion (already covered by
+# test_start_cpu_restarts_after_halt), not a genuine mid-execution
+# interrupt.
+#
+# To actually catch the CPU still running, the program below loops for
+# more than CLKS_PER_BYTE cycles using two nested counters (each loaded
+# via a 4-bit LDI immediate, max 15), with NOP padding inside the inner
+# loop body to stretch the total runtime comfortably past one UART byte
+# period. It also STOREs its outer counter to GPIO at the start of every
+# outer pass, which acts as an observable "progress marker": if the
+# restart works, that marker jumps back to its initial value (15) shortly
+# after the second start pulse; if restart is broken, the counter just
+# keeps counting down from wherever the interrupt found it.
+# ---------------------------------------------------------------------------
+
+INNER_LOOP_NOP_COUNT = 24
+
+
+def build_interruptible_loop_program(counter_ram_addr=0x5):
+    """Nested LDI(15)-counter loop, long enough to still be running more
+    than one full UART byte period (CLKS_PER_BYTE cycles) after it starts.
+    Returns (program, addr_of_outer_start) where addr_of_outer_start is the
+    instruction address of the marker STORE at the top of the outer loop
+    (used only for documentation/debugging, not required by the test)."""
+    program = []
+
+    def addr():
+        return len(program)
+
+    # Setup: outer counter (in RAM) = 15
+    program.append(enc(OP_LDI, 15))
+    program.append(enc(OP_STORE, counter_ram_addr))
+
+    outer_start = addr()
+    program.append(enc(OP_LOAD, counter_ram_addr))       # acc = outer
+    program.append(enc(OP_STORE, GPIO_OUT_ADDR))          # marker write
+    program.append(enc(OP_LDI, 15))                       # inner = 15
+
+    inner_start = addr()
+    program.append(enc(OP_DEC, 0))                        # inner--
+    for _ in range(INNER_LOOP_NOP_COUNT):
+        program.append(enc(OP_NOP, 0))
+    program.append(enc(OP_BNZ, inner_start))               # loop while inner != 0
+
+    program.append(enc(OP_LOAD, counter_ram_addr))         # acc = outer
+    program.append(enc(OP_DEC, 0))                         # outer--
+    program.append(enc(OP_STORE, counter_ram_addr))        # RAM[counter] = outer
+    program.append(enc(OP_BNZ, outer_start))                # loop while outer != 0
+
+    program.append(enc(OP_STORE, GPIO_OUT_ADDR))            # final marker (0)
+    program.append(enc(OP_HALT, 0))
+
+    return program, outer_start
+
+
 @cocotb.test()
 async def test_start_cpu_restarts_mid_execution(dut):
-    """Sending 0x55 again while the CPU is mid-program (not yet halted)
-    must reset pc back to 0 and clear the accumulator, per cpu_top8.sv's
-    `else if (start_cpu)` branch taking priority every cycle it's sampled."""
+    """Sending 0x55 again while the CPU is genuinely still running (not
+    yet halted) must reset pc back to 0 and clear the accumulator, per
+    cpu_top8.sv's `else if (start_cpu)` branch taking priority every
+    cycle it's sampled.
+
+    See build_interruptible_loop_program()'s docstring for why the
+    program has to be this long: a second UART start byte can only ever
+    arrive ~CLKS_PER_BYTE (5200) cycles after the first one, so the
+    program under test must still be running well past that point for
+    this to be a genuine mid-execution interrupt rather than a restart
+    of an already-finished (HALTed) program.
+    """
     uart = await reset_dut(dut)
 
-    program = [
-        enc(OP_LDI, 5),
-        enc(OP_NOP, 0),
-        enc(OP_NOP, 0),
-        enc(OP_NOP, 0),
-        enc(OP_STORE, GPIO_OUT_ADDR),   # would set uo_out=5 if left alone
-        enc(OP_HALT, 0),
-    ]
+    program, _ = build_interruptible_loop_program()
     await uart.load_program(program)
     await uart.start_cpu()
 
-    # Interrupt after LDI has executed but before the STORE.
+    # Total loop runtime is well over CLKS_PER_BYTE cycles (with the
+    # chosen INNER_LOOP_NOP_COUNT), so waiting only a couple of cycles
+    # here still lands well inside the first pass of the loop.
     await ClockCycles(dut.clk, 2)
     await uart.start_cpu()  # restart: pc<-0, accumulator<-0
 
-    await ClockCycles(dut.clk, 30)
+    # Give the restarted program just long enough to re-reach its first
+    # marker write (LDI, STORE, LOAD, STORE = 4 instructions in).
+    await ClockCycles(dut.clk, 10)
 
-    assert dut.uo_out.value == 0, (
-        "restart mid-program should re-run from pc=0 with a cleared "
-        f"accumulator instead of finishing the interrupted run; got "
-        f"{int(dut.uo_out.value)}"
+    assert dut.uo_out.value == 15, (
+        "restart mid-program should re-run from pc=0 (accumulator "
+        "cleared) and re-write the outer counter's initial value (15) "
+        f"to GPIO; got {int(dut.uo_out.value)} — if this is a low value "
+        "instead, the CPU likely kept running the original, uninterrupted "
+        "loop rather than restarting"
     )
 
 
