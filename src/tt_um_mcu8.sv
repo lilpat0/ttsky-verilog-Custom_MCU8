@@ -24,9 +24,10 @@ module tt_um_cpu8 (
     wire start_cpu;
 
     // Value written via STORE 0xD (the fixed uio output port).
-    // Only the upper nibble is used, since uio_out[7:4] is the
-    // only output-direction half of the fixed 4-out/4-in split.
-    wire [7:0] uio_store_data;
+    // Only 4 bits -- this is the upper nibble of the accumulator,
+    // driving the only output-direction half of the fixed
+    // 4-out/4-in uio split.
+    wire [3:0] uio_store_data;
 
     // =========================================================
     // UART
@@ -75,7 +76,7 @@ module tt_um_cpu8 (
 
         .gpio_oe(),
 
-        .uio_out_reg(uio_store_data)
+        .uio_store(uio_store_data)
 
     );
 
@@ -89,7 +90,7 @@ module tt_um_cpu8 (
     // No UART TX currently implemented.
     // =========================================================
 
-    assign uio_out = {uio_store_data[7:4], 4'b0000};
+    assign uio_out = {uio_store_data, 4'b0000};
     assign uio_oe  = 8'hF0;
 
 endmodule
