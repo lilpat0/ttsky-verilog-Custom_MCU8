@@ -23,6 +23,11 @@ module tt_um_cpu8 (
 
     wire start_cpu;
 
+    // Value written via STORE 0xD (the fixed uio output port).
+    // Only the upper nibble is used, since uio_out[7:4] is the
+    // only output-direction half of the fixed 4-out/4-in split.
+    wire [7:0] uio_store_data;
+
     // =========================================================
     // UART
     //
@@ -68,19 +73,23 @@ module tt_um_cpu8 (
 
         .gpio_out(uo_out),
 
-        .gpio_oe()
+        .gpio_oe(),
+
+        .uio_out_reg(uio_store_data)
 
     );
 
     // =========================================================
     // Bidirectional pins
     //
-    // uio_in[0] = UART RX
+    // Fixed 4-out/4-in split, hardwired (not reset-dependent):
+    //   uio_out[7:4] / uio_oe[7:4] = output, driven by STORE 0xD
+    //   uio_in[3:0]  / uio_oe[3:0] = input  (uio_in[0] = UART RX)
     //
     // No UART TX currently implemented.
     // =========================================================
 
-    assign uio_out = 8'h00;
-    assign uio_oe  = 8'h00;
+    assign uio_out = {uio_store_data[7:4], 4'b0000};
+    assign uio_oe  = 8'hF0;
 
 endmodule
