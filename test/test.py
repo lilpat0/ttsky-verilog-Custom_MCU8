@@ -1,34 +1,23 @@
 """
 Cocotb testbench for tt_um_cpu8
 
-DUT hierarchy exercised (top-level only — this mirrors how the design is
-actually driven on real silicon / the Tiny Tapeout harness):
+Physical-pin-only testbench.
 
-    tt_um_cpu8
-      |-- uart_programmer8   (rx = uio_in[0])
-      |-- cpu8
-            |-- instruction_memory8
-            |-- decode8
-            |-- alu8
-            |-- ram8
-            |-- gpio8
-            |-- pc8
+UART programming protocol:
 
-There is no direct access to program_we/program_address/program_data from
-outside the chip, so the only way to load a program is to bit-bang the
-same UART protocol the uart_programmer8 module expects:
+    0xAA <addr> <data>   -> write instruction memory
+    0x55                 -> start/restart CPU
 
-    0xAA <addr> <data>   -> write <data> into instruction memory at <addr>
-    0x55                 -> start the CPU (pc <- 0, running <- 1)
+Physical UIO mapping:
 
-UART timing is derived from the RTL parameters that are hard-coded into
-tt_um_cpu8 (CLK_FREQ = 60_000_000, BAUD_RATE = 115200), expressed in
-clock cycles, so the testbench clock period itself is arbitrary.
+    uio_in[0]   = UART RX
+    uio_in[3:1] = general-purpose inputs
+    uio_in[7:4] = unused inputs
 
-Run with Icarus Verilog, from a directory containing all the .sv files
-and this test.py + the accompanying Makefile:
+    uio_out[7:4] = general-purpose outputs
+    uio_out[3:0] = 0
 
-    make
+    uio_oe = 8'hF0
 """
 
 import random
@@ -39,7 +28,7 @@ from cocotb.triggers import ClockCycles
 
 
 # ---------------------------------------------------------------------------
-# Physical-pin-only access
+# Physical pins
 # ---------------------------------------------------------------------------
 
 PHYSICAL_PINS = (
@@ -55,8 +44,6 @@ PHYSICAL_PINS = (
 
 
 def _assert_pin_only_access(dut):
-    """Fail fast if the DUT is not the expected Tiny Tapeout wrapper."""
-
     missing = [p for p in PHYSICAL_PINS if not hasattr(dut, p)]
 
     assert not missing, (
@@ -66,7 +53,7 @@ def _assert_pin_only_access(dut):
 
 
 # ---------------------------------------------------------------------------
-# ISA / encoding helpers
+# ISA
 # ---------------------------------------------------------------------------
 
 OP_NOP   = 0x0
@@ -88,7 +75,7 @@ OP_HALT  = 0xF
 
 
 # ---------------------------------------------------------------------------
-# Memory-mapped GPIO addresses
+# Memory-mapped addresses
 # ---------------------------------------------------------------------------
 
 GPIO_OUT_ADDR = 0xC
@@ -97,8 +84,6 @@ GPIO_IN_ADDR  = 0xE
 
 
 def enc(opcode, operand):
-    """Pack a 4-bit opcode + 4-bit operand into one instruction byte."""
-
     assert 0 <= opcode <= 0xF
     assert 0 <= operand <= 0xF
 
@@ -106,7 +91,7 @@ def enc(opcode, operand):
 
 
 # ---------------------------------------------------------------------------
-# UART bit-bang helpers
+# UART
 # ---------------------------------------------------------------------------
 
 CLK_FREQ = 60_000_000
@@ -118,57 +103,34 @@ CLKS_PER_BYTE = CLKS_PER_BIT * 10
 
 class UartProgrammer:
     """
-    Bit-bangs the AA/addr/data + 55 protocol onto uio_in[0].
+    Bit-bangs UART RX on uio_in[0].
 
     IMPORTANT:
 
         uio_in[0]   = UART RX
-        uio_in[3:1] = fixed general-purpose inputs
-        uio_in[7:4] = unused inputs
+        uio_in[3:1] = general inputs
 
-    Bits [7:1] are NEVER modified by UART transmission.
+    UART operations MUST NOT modify uio_in[3:1].
     """
 
     def __init__(self, dut):
         self.dut = dut
 
-        # Capture all non-UART bits when the programmer is created.
-        #
-        # bit 0 is deliberately excluded because UART owns it.
-        self.fixed_uio_bits = int(self.dut.uio_in.value) & 0xFE
-
-    def set_general_inputs(self, bits3to1):
-        """
-        Set uio_in[3:1] and preserve them for all future UART activity.
-
-        bits3to1 is a 3-bit value corresponding to uio_in[3:1].
-        """
-
-        assert 0 <= bits3to1 <= 0x7
-
-        self.fixed_uio_bits = (
-            (self.fixed_uio_bits & 0xF1)
-            | ((bits3to1 & 0x7) << 1)
-        )
-
-        # UART idle high.
-        self.dut.uio_in.value = self.fixed_uio_bits | 0x01
-
     def _drive_rx(self, bit):
         """
-        Drive ONLY uio_in[0].
+        Change ONLY uio_in[0].
 
-        Bits [7:1] come from fixed_uio_bits and are never overwritten.
+        Bits [7:1] are read from the current physical pin value and
+        preserved exactly.
         """
 
-        self.dut.uio_in.value = (
-            self.fixed_uio_bits
-            | (bit & 0x01)
-        )
+        current = int(self.dut.uio_in.value)
+
+        new_value = (current & 0xFE) | (bit & 0x01)
+
+        self.dut.uio_in.value = new_value
 
     async def _send_bit(self, bit):
-        """Drive one UART bit for exactly CLKS_PER_BIT clock cycles."""
-
         self._drive_rx(bit)
         await ClockCycles(
             self.dut.clk,
@@ -176,7 +138,9 @@ class UartProgrammer:
         )
 
     async def idle(self, cycles=CLKS_PER_BIT):
-        """UART idle state is logic 1."""
+        """
+        Drive UART RX idle-high while preserving uio_in[7:1].
+        """
 
         self._drive_rx(1)
 
@@ -187,11 +151,11 @@ class UartProgrammer:
 
     async def send_byte(self, byte_val):
         """
-        Send one UART byte:
+        UART:
 
-            start bit = 0
+            start = 0
             8 data bits, LSB first
-            stop bit = 1
+            stop = 1
         """
 
         await self._send_bit(0)
@@ -215,8 +179,6 @@ class UartProgrammer:
         await self.send_byte(data)
 
     async def load_program(self, instructions, start_addr=0):
-        """Program a sequence of instructions into instruction memory."""
-
         for offset, instr in enumerate(instructions):
             await self.program(
                 start_addr + offset,
@@ -224,20 +186,76 @@ class UartProgrammer:
             )
 
     async def start_cpu(self):
-        """Send the 0x55 CPU-start command."""
+        """
+        Send the 0x55 start command.
+        """
 
         await self.send_byte(0x55)
 
 
 # ---------------------------------------------------------------------------
-# Common setup
+# UIO helper
+# ---------------------------------------------------------------------------
+
+def set_uio_general_inputs(dut, bits3to1):
+    """
+    Set uio_in[3:1] to the supplied 3-bit value.
+
+    uio_in[0] is always forced HIGH because UART RX is idle.
+
+    Bits [7:4] are kept at zero.
+
+    Example:
+
+        bits3to1 = 0b101
+
+        uio_in = 0000_1011
+                         ^^^
+                         101 on bits [3:1]
+                         bit 0 = 1
+    """
+
+    assert 0 <= bits3to1 <= 0x7
+
+    # Construct the COMPLETE physical input value.
+    #
+    # bits [7:4] = 0000
+    # bits [3:1] = requested value
+    # bit  [0]   = UART idle high
+    #
+    # This avoids relying on any previous value of uio_in.
+    value = ((bits3to1 & 0x7) << 1) | 0x01
+
+    dut.uio_in.value = value
+
+    # Verify immediately that the simulator accepted the drive.
+    actual = int(dut.uio_in.value)
+
+    assert ((actual >> 1) & 0x7) == bits3to1, (
+        "testbench failed to drive uio_in[3:1]: "
+        f"requested={bits3to1:03b}, "
+        f"uio_in={actual:#04x}"
+    )
+
+    assert (actual & 0x1) == 1, (
+        "UART RX must remain idle-high after setting UIO inputs; "
+        f"uio_in={actual:#04x}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Reset
 # ---------------------------------------------------------------------------
 
 async def reset_dut(dut, clk_period_ns=10):
     """
     Reset the DUT and start the clock.
 
-    uio_in starts with UART RX idle-high.
+    IMPORTANT:
+    uio_in is initialized to 0x01:
+
+        uio_in[0] = 1
+        uio_in[7:1] = 0
     """
 
     _assert_pin_only_access(dut)
@@ -246,14 +264,14 @@ async def reset_dut(dut, clk_period_ns=10):
         Clock(
             dut.clk,
             clk_period_ns,
-            units="ns"
+            unit="ns",
         ).start()
     )
 
     dut.ena.value = 1
     dut.ui_in.value = 0
 
-    # UART RX idle-high.
+    # UART idle high.
     dut.uio_in.value = 0x01
 
     dut.rst_n.value = 0
@@ -279,14 +297,18 @@ async def reset_dut(dut, clk_period_ns=10):
     return uart
 
 
+# ---------------------------------------------------------------------------
+# Program runner
+# ---------------------------------------------------------------------------
+
 async def run_program(
     dut,
     uart,
     instructions,
-    settle_cycles=20
+    settle_cycles=20,
 ):
     """
-    Load instructions starting at address 0 and start the CPU.
+    Load program at address 0 and start CPU.
     """
 
     await uart.load_program(
@@ -303,38 +325,17 @@ async def run_program(
 
 async def wait_for_halt(
     dut,
-    timeout_cycles=2000
+    timeout_cycles=2000,
 ):
     """
-    HALT is not directly exposed as a physical pin.
+    HALT is not externally visible.
 
-    Therefore tests simply wait long enough for the known program
-    to complete.
+    Wait long enough for the known test program to finish.
     """
 
     await ClockCycles(
         dut.clk,
         timeout_cycles
-    )
-
-
-def set_uio_general_inputs(dut, bits3to1):
-    """
-    Set uio_in[3:1] while keeping UART RX uio_in[0] high.
-
-    bits3to1:
-        3-bit value corresponding to uio_in[3:1].
-    """
-
-    assert 0 <= bits3to1 <= 0x7
-
-    current = int(dut.uio_in.value)
-
-    # Preserve bits [7:4], replace [3:1], force UART RX high.
-    dut.uio_in.value = (
-        (current & 0xF0)
-        | ((bits3to1 & 0x7) << 1)
-        | 0x01
     )
 
 
@@ -345,11 +346,7 @@ def set_uio_general_inputs(dut, bits3to1):
 @cocotb.test()
 async def test_reset_state(dut):
     """
-    After reset, before any program/start:
-
-        uo_out = 0
-        uio_oe = 0xF0
-        uio_out[7:4] = 0
+    Verify physical pins immediately after reset.
     """
 
     await reset_dut(dut)
@@ -359,11 +356,12 @@ async def test_reset_state(dut):
     )
 
     assert dut.uio_oe.value == 0xF0, (
-        "uio_oe should be 0xF0"
+        "uio_oe should equal 0xF0; "
+        f"got {int(dut.uio_oe.value):#04x}"
     )
 
     assert (int(dut.uio_out.value) >> 4) == 0, (
-        "uio general outputs should be 0 out of reset"
+        "uio_out[7:4] should be zero out of reset"
     )
 
 
@@ -375,8 +373,7 @@ async def test_ldi_add_store(dut):
     STORE GPIO
     HALT
 
-    Expected:
-        uo_out = 8
+    Expected = 8.
     """
 
     uart = await reset_dut(dut)
@@ -396,7 +393,7 @@ async def test_ldi_add_store(dut):
 
     await wait_for_halt(
         dut,
-        timeout_cycles=50
+        50
     )
 
     assert dut.uo_out.value == 8, (
@@ -407,7 +404,9 @@ async def test_ldi_add_store(dut):
 
 @cocotb.test()
 async def test_alu_ops(dut):
-    """Sweep each ALU opcode through a simple program."""
+    """
+    Test all ALU operations.
+    """
 
     def alu_model(op, a, b):
 
@@ -444,7 +443,7 @@ async def test_alu_ops(dut):
         (OP_AND, 0b1100, 0b1010),
         (OP_OR, 0b1100, 0b0011),
         (OP_XOR, 0b1111, 0b1010),
-        (OP_NOT, 0b0000_1010, 0),
+        (OP_NOT, 0b1010, 0),
         (OP_INC, 7, 0),
         (OP_DEC, 7, 0),
     ]
@@ -468,7 +467,7 @@ async def test_alu_ops(dut):
 
         await wait_for_halt(
             dut,
-            timeout_cycles=50
+            50
         )
 
         expected = alu_model(
@@ -477,9 +476,7 @@ async def test_alu_ops(dut):
             b & 0xF
         )
 
-        got = int(
-            dut.uo_out.value
-        )
+        got = int(dut.uo_out.value)
 
         assert got == expected, (
             f"op={op:#x} a={a} b={b}: "
@@ -489,7 +486,9 @@ async def test_alu_ops(dut):
 
 @cocotb.test()
 async def test_ram_load_store(dut):
-    """STORE to RAM, LOAD from RAM, output through GPIO."""
+    """
+    STORE to RAM, clear accumulator, LOAD back, STORE to GPIO.
+    """
 
     uart = await reset_dut(dut)
 
@@ -512,18 +511,17 @@ async def test_ram_load_store(dut):
 
     await wait_for_halt(
         dut,
-        timeout_cycles=50
+        50
     )
 
-    assert dut.uo_out.value == 9, (
-        f"expected uo_out=9, "
-        f"got {int(dut.uo_out.value)}"
-    )
+    assert dut.uo_out.value == 9
 
 
 @cocotb.test()
 async def test_gpio_input_passthrough(dut):
-    """LOAD GPIO input and output it through GPIO output."""
+    """
+    LOAD GPIO input and output through GPIO.
+    """
 
     uart = await reset_dut(dut)
 
@@ -545,18 +543,17 @@ async def test_gpio_input_passthrough(dut):
 
     await wait_for_halt(
         dut,
-        timeout_cycles=50
+        50
     )
 
-    assert dut.uo_out.value == test_value, (
-        f"expected uo_out={test_value:#x}, "
-        f"got {int(dut.uo_out.value):#x}"
-    )
+    assert dut.uo_out.value == test_value
 
 
 @cocotb.test()
 async def test_jmp(dut):
-    """JMP over a poison instruction."""
+    """
+    JMP over poison instruction.
+    """
 
     uart = await reset_dut(dut)
 
@@ -577,18 +574,17 @@ async def test_jmp(dut):
 
     await wait_for_halt(
         dut,
-        timeout_cycles=50
+        50
     )
 
-    assert dut.uo_out.value == 1, (
-        f"expected uo_out=1, "
-        f"got {int(dut.uo_out.value)}"
-    )
+    assert dut.uo_out.value == 1
 
 
 @cocotb.test()
 async def test_branch_zero_taken(dut):
-    """BZ taken."""
+    """
+    BZ taken.
+    """
 
     uart = await reset_dut(dut)
 
@@ -609,18 +605,17 @@ async def test_branch_zero_taken(dut):
 
     await wait_for_halt(
         dut,
-        timeout_cycles=50
+        50
     )
 
-    assert dut.uo_out.value == 0, (
-        f"expected uo_out=0, "
-        f"got {int(dut.uo_out.value)}"
-    )
+    assert dut.uo_out.value == 0
 
 
 @cocotb.test()
 async def test_branch_zero_not_taken(dut):
-    """BZ not taken."""
+    """
+    BZ not taken.
+    """
 
     uart = await reset_dut(dut)
 
@@ -641,18 +636,17 @@ async def test_branch_zero_not_taken(dut):
 
     await wait_for_halt(
         dut,
-        timeout_cycles=50
+        50
     )
 
-    assert dut.uo_out.value == 7, (
-        f"expected uo_out=7, "
-        f"got {int(dut.uo_out.value)}"
-    )
+    assert dut.uo_out.value == 7
 
 
 @cocotb.test()
 async def test_branch_not_zero(dut):
-    """BNZ taken."""
+    """
+    BNZ taken.
+    """
 
     uart = await reset_dut(dut)
 
@@ -673,18 +667,17 @@ async def test_branch_not_zero(dut):
 
     await wait_for_halt(
         dut,
-        timeout_cycles=50
+        50
     )
 
-    assert dut.uo_out.value == 3, (
-        f"expected uo_out=3, "
-        f"got {int(dut.uo_out.value)}"
-    )
+    assert dut.uo_out.value == 3
 
 
 @cocotb.test()
 async def test_halt_freezes_accumulator(dut):
-    """HALT must stop further execution."""
+    """
+    HALT prevents further execution.
+    """
 
     uart = await reset_dut(dut)
 
@@ -704,7 +697,7 @@ async def test_halt_freezes_accumulator(dut):
 
     await wait_for_halt(
         dut,
-        timeout_cycles=50
+        50
     )
 
     assert dut.uo_out.value == 4
@@ -714,14 +707,14 @@ async def test_halt_freezes_accumulator(dut):
         200
     )
 
-    assert dut.uo_out.value == 4, (
-        "CPU kept executing past HALT"
-    )
+    assert dut.uo_out.value == 4
 
 
 @cocotb.test()
 async def test_ena_gating(dut):
-    """CPU must not run while ena=0."""
+    """
+    CPU must not execute while ena=0.
+    """
 
     uart = await reset_dut(dut)
 
@@ -731,9 +724,7 @@ async def test_ena_gating(dut):
         enc(OP_HALT, 0),
     ]
 
-    await uart.load_program(
-        program
-    )
+    await uart.load_program(program)
 
     dut.ena.value = 0
 
@@ -744,9 +735,7 @@ async def test_ena_gating(dut):
         50
     )
 
-    assert dut.uo_out.value == 0, (
-        "CPU should not run while ena=0"
-    )
+    assert dut.uo_out.value == 0
 
     dut.ena.value = 1
 
@@ -762,14 +751,14 @@ async def test_ena_gating(dut):
         50
     )
 
-    assert dut.uo_out.value == 6, (
-        "CPU should run once ena=1 and restarted"
-    )
+    assert dut.uo_out.value == 6
 
 
 @cocotb.test()
 async def test_nop(dut):
-    """NOP must not disturb the accumulator."""
+    """
+    NOP does not modify accumulator.
+    """
 
     uart = await reset_dut(dut)
 
@@ -789,18 +778,17 @@ async def test_nop(dut):
 
     await wait_for_halt(
         dut,
-        timeout_cycles=50
+        50
     )
 
-    assert dut.uo_out.value == 6, (
-        f"expected uo_out=6, "
-        f"got {int(dut.uo_out.value)}"
-    )
+    assert dut.uo_out.value == 6
 
 
 @cocotb.test()
 async def test_ram_address_sweep(dut):
-    """Store and load every normal RAM address."""
+    """
+    Test every normal RAM address.
+    """
 
     ram_addrs = [
         a
@@ -808,7 +796,7 @@ async def test_ram_address_sweep(dut):
         if a not in (
             GPIO_OUT_ADDR,
             UIO_ADDR,
-            GPIO_IN_ADDR
+            GPIO_IN_ADDR,
         )
     ]
 
@@ -839,12 +827,10 @@ async def test_ram_address_sweep(dut):
 
         await wait_for_halt(
             dut,
-            timeout_cycles=50
+            50
         )
 
-        got = int(
-            dut.uo_out.value
-        )
+        got = int(dut.uo_out.value)
 
         assert got == value, (
             f"RAM addr {addr:#x}: "
@@ -886,10 +872,10 @@ async def test_load_gpio_addr_reads_ram_not_gpio(dut):
 
     await wait_for_halt(
         dut,
-        timeout_cycles=80
+        80
     )
 
-    first_result = dut.uo_out.value
+    first_result = int(dut.uo_out.value)
 
     uart = await reset_dut(dut)
 
@@ -901,21 +887,22 @@ async def test_load_gpio_addr_reads_ram_not_gpio(dut):
 
     await wait_for_halt(
         dut,
-        timeout_cycles=80
+        80
     )
 
-    second_result = dut.uo_out.value
+    second_result = int(dut.uo_out.value)
 
     assert first_result == second_result, (
-        "LOAD 0xC should read a fixed RAM location, independent "
-        "of GPIO output; "
-        f"got {first_result} vs {second_result}"
+        "LOAD 0xC should read fixed RAM[0xC], independent of "
+        f"GPIO output: first={first_result}, second={second_result}"
     )
 
 
 @cocotb.test()
 async def test_uio_store_isolated_from_gpio_out(dut):
-    """STORE 0xD must not corrupt GPIO output."""
+    """
+    STORE 0xD must not affect GPIO output.
+    """
 
     uart = await reset_dut(dut)
 
@@ -937,51 +924,44 @@ async def test_uio_store_isolated_from_gpio_out(dut):
 
     await wait_for_halt(
         dut,
-        timeout_cycles=50
+        50
     )
 
-    assert dut.uo_out.value == 4, (
-        "STORE to UIO altered uo_out: "
-        f"got {int(dut.uo_out.value)}"
+    assert dut.uo_out.value == 4
+
+    assert (
+        (int(dut.uio_out.value) >> 4) == 0xF
     )
 
-    assert (int(dut.uio_out.value) >> 4) == 0xF, (
-        "STORE 0xD should drive uio_out[7:4]=0xF, "
-        f"got {int(dut.uio_out.value):#04x}"
-    )
 
+# ---------------------------------------------------------------------------
+# IMPORTANT FIXED TEST
+# ---------------------------------------------------------------------------
 
 @cocotb.test()
 async def test_uio_fixed_io(dut):
     """
-    Verify the fixed UIO direction:
+    Verify:
 
         uio[7:4] = outputs
         uio[3:1] = general inputs
         uio[0]   = UART RX
 
-    uio_oe must always equal 0xF0.
+    Therefore:
 
-    IMPORTANT:
-    The general input value is deliberately applied AFTER UART programming.
-    This guarantees that the UART activity cannot accidentally overwrite the
-    value being tested.
+        uio_oe = 0xF0
     """
 
-    uart = await reset_dut(dut)
+    # ---------------------------------------------------------------
+    # Part 1: UIO output
+    # ---------------------------------------------------------------
 
-    # ---------------------------------------------------------------
-    # Fixed direction
-    # ---------------------------------------------------------------
+    uart = await reset_dut(dut)
 
     assert dut.uio_oe.value == 0xF0, (
         f"expected uio_oe=0xF0, "
         f"got {int(dut.uio_oe.value):#04x}"
     )
-
-    # ---------------------------------------------------------------
-    # STORE 0xD -> uio_out[7:4]
-    # ---------------------------------------------------------------
 
     program = [
         enc(OP_LDI, 0xB),
@@ -997,19 +977,48 @@ async def test_uio_fixed_io(dut):
 
     await wait_for_halt(
         dut,
-        timeout_cycles=50
+        50
     )
 
-    assert (int(dut.uio_out.value) >> 4) == 0xB, (
-        "expected uio_out[7:4]=0xB, "
+    assert (
+        (int(dut.uio_out.value) >> 4) == 0xB
+    ), (
+        f"expected uio_out[7:4]=0xB, "
         f"got {int(dut.uio_out.value):#04x}"
     )
 
     # ---------------------------------------------------------------
-    # LOAD 0xD -> uio_in[3:1]
+    # Part 2: UIO input
     # ---------------------------------------------------------------
 
     uart = await reset_dut(dut)
+
+    # IMPORTANT:
+    #
+    # Set the physical input AFTER reset and BEFORE programming.
+    #
+    # This creates:
+    #
+    #     uio_in = 0000_1011
+    #
+    # bits [3:1] = 101
+    # bit  [0]   = 1 (UART idle)
+    set_uio_general_inputs(
+        dut,
+        0b101
+    )
+
+    # Verify the physical pin BEFORE UART activity.
+    actual_before_uart = int(dut.uio_in.value)
+
+    assert actual_before_uart == 0x0B, (
+        "uio_in was not correctly initialized before CPU "
+        f"programming: expected 0x0B, got {actual_before_uart:#04x}"
+    )
+
+    # ---------------------------------------------------------------
+    # Program while preserving uio_in[3:1].
+    # ---------------------------------------------------------------
 
     program = [
         enc(OP_LOAD, UIO_ADDR),
@@ -1017,75 +1026,38 @@ async def test_uio_fixed_io(dut):
         enc(OP_HALT, 0),
     ]
 
-    # ---------------------------------------------------------------
-    # IMPORTANT FIX:
-    #
-    # Program the instruction memory FIRST.
-    #
-    # Then set uio_in[3:1].
-    #
-    # Then explicitly restore the same value after programming and
-    # immediately before sending 0x55.
-    # ---------------------------------------------------------------
-
-    await uart.load_program(
+    await run_program(
+        dut,
+        uart,
         program
-    )
-
-    set_uio_general_inputs(
-        dut,
-        0b101
-    )
-
-    # Verify the actual physical input pins before starting the CPU.
-    actual_uio = int(
-        dut.uio_in.value
-    )
-
-    assert ((actual_uio >> 1) & 0x7) == 0b101, (
-        "testbench failed to drive uio_in[3:1]=101 before CPU start; "
-        f"uio_in={actual_uio:#04x}"
-    )
-
-    assert (actual_uio & 0x1) == 1, (
-        "UART RX must remain idle-high before CPU start"
-    )
-
-    # Start CPU only AFTER the UIO input has been established.
-    await uart.start_cpu()
-
-    await ClockCycles(
-        dut.clk,
-        20
-    )
-
-    # The UART helper preserves bits [7:1], but explicitly restore the
-    # expected value once more before the CPU gets enough cycles to
-    # execute the LOAD instruction.
-    set_uio_general_inputs(
-        dut,
-        0b101
     )
 
     await wait_for_halt(
         dut,
-        timeout_cycles=50
+        50
     )
 
-    got = int(
-        dut.uo_out.value
+    # The UART helper must have preserved bits [3:1].
+    actual_after_uart = int(dut.uio_in.value)
+
+    assert (
+        ((actual_after_uart >> 1) & 0x7) == 0b101
+    ), (
+        "UART programming corrupted uio_in[3:1]: "
+        f"uio_in={actual_after_uart:#04x}"
     )
 
-    assert got == 0b101, (
+    assert dut.uo_out.value == 0b101, (
         "expected uo_out=0b101 from uio_in[3:1], "
-        f"got {got:#04x}; "
-        f"uio_in={int(dut.uio_in.value):#04x}"
+        f"got {int(dut.uo_out.value):#04x}"
     )
 
 
 @cocotb.test()
 async def test_gpio_input_tracks_live_changes(dut):
-    """GPIO input must be live/combinational."""
+    """
+    GPIO input is live.
+    """
 
     uart = await reset_dut(dut)
 
@@ -1105,7 +1077,7 @@ async def test_gpio_input_tracks_live_changes(dut):
 
     await wait_for_halt(
         dut,
-        timeout_cycles=50
+        50
     )
 
     assert dut.uo_out.value == 0x3C
@@ -1122,7 +1094,7 @@ async def test_gpio_input_tracks_live_changes(dut):
 
     await wait_for_halt(
         dut,
-        timeout_cycles=50
+        50
     )
 
     assert dut.uo_out.value == 0xC3
@@ -1130,7 +1102,19 @@ async def test_gpio_input_tracks_live_changes(dut):
 
 @cocotb.test()
 async def test_backward_branch_loop(dut):
-    """Countdown loop."""
+    """
+    Countdown:
+
+        LDI 3
+    loop:
+        STORE C
+        DEC
+        BNZ loop
+        STORE C
+        HALT
+
+    Expected = 0.
+    """
 
     uart = await reset_dut(dut)
 
@@ -1146,24 +1130,22 @@ async def test_backward_branch_loop(dut):
     await run_program(
         dut,
         uart,
-        program,
-        settle_cycles=20
+        program
     )
 
     await wait_for_halt(
         dut,
-        timeout_cycles=200
+        200
     )
 
-    assert dut.uo_out.value == 0, (
-        "expected loop to count down to 0, "
-        f"got {int(dut.uo_out.value)}"
-    )
+    assert dut.uo_out.value == 0
 
 
 @cocotb.test()
 async def test_uart_garbage_bytes_are_ignored(dut):
-    """Garbage UART bytes must be ignored."""
+    """
+    Garbage UART bytes must be ignored.
+    """
 
     uart = await reset_dut(dut)
 
@@ -1171,7 +1153,7 @@ async def test_uart_garbage_bytes_are_ignored(dut):
         0x00,
         0x01,
         0xFF,
-        0x7E
+        0x7E,
     ):
         await uart.send_byte(junk)
 
@@ -1189,18 +1171,17 @@ async def test_uart_garbage_bytes_are_ignored(dut):
 
     await wait_for_halt(
         dut,
-        timeout_cycles=50
+        50
     )
 
-    assert dut.uo_out.value == 2, (
-        "garbage UART bytes should be ignored; "
-        f"got {int(dut.uo_out.value)}"
-    )
+    assert dut.uo_out.value == 2
 
 
 @cocotb.test()
 async def test_uart_reprogram_overwrites_instruction_memory(dut):
-    """Program A, then overwrite it with Program B."""
+    """
+    Program A, run it, then overwrite with Program B.
+    """
 
     uart = await reset_dut(dut)
 
@@ -1218,7 +1199,7 @@ async def test_uart_reprogram_overwrites_instruction_memory(dut):
 
     await wait_for_halt(
         dut,
-        timeout_cycles=50
+        50
     )
 
     assert dut.uo_out.value == 1
@@ -1229,9 +1210,7 @@ async def test_uart_reprogram_overwrites_instruction_memory(dut):
         enc(OP_HALT, 0),
     ]
 
-    await uart.load_program(
-        program_b
-    )
+    await uart.load_program(program_b)
 
     await uart.start_cpu()
 
@@ -1240,14 +1219,11 @@ async def test_uart_reprogram_overwrites_instruction_memory(dut):
         30
     )
 
-    assert dut.uo_out.value == 9, (
-        f"expected reprogrammed value 9, "
-        f"got {int(dut.uo_out.value)}"
-    )
+    assert dut.uo_out.value == 9
 
 
 # ---------------------------------------------------------------------------
-# Long-running interruptible program
+# Long-running restart test
 # ---------------------------------------------------------------------------
 
 INNER_LOOP_NOP_COUNT = 24
@@ -1327,16 +1303,14 @@ def build_interruptible_loop_program(counter_ram_addr=0x5):
 @cocotb.test()
 async def test_start_cpu_restarts_mid_execution(dut):
     """
-    Sending 0x55 again while CPU is still running must restart it.
+    A second 0x55 must restart execution from PC=0.
     """
 
     uart = await reset_dut(dut)
 
     program, _ = build_interruptible_loop_program()
 
-    await uart.load_program(
-        program
-    )
+    await uart.load_program(program)
 
     await uart.start_cpu()
 
@@ -1353,15 +1327,16 @@ async def test_start_cpu_restarts_mid_execution(dut):
     )
 
     assert dut.uo_out.value == 15, (
-        "restart mid-program should re-run from pc=0 and re-write "
-        "the outer counter's initial value (15) to GPIO; "
+        "restart should re-run from PC=0; "
         f"got {int(dut.uo_out.value)}"
     )
 
 
 @cocotb.test()
 async def test_start_cpu_restarts_after_halt(dut):
-    """0x55 after HALT must restart execution."""
+    """
+    0x55 after HALT must restart execution.
+    """
 
     uart = await reset_dut(dut)
 
@@ -1379,7 +1354,7 @@ async def test_start_cpu_restarts_after_halt(dut):
 
     await wait_for_halt(
         dut,
-        timeout_cycles=50
+        50
     )
 
     assert dut.uo_out.value == 7
@@ -1391,14 +1366,14 @@ async def test_start_cpu_restarts_after_halt(dut):
         30
     )
 
-    assert dut.uo_out.value == 7, (
-        "restart after HALT should re-run the same program"
-    )
+    assert dut.uo_out.value == 7
 
 
 @cocotb.test()
 async def test_random_alu_immediate_program(dut):
-    """Randomized ALU regression."""
+    """
+    Randomized ALU regression.
+    """
 
     random.seed(1)
 
@@ -1430,9 +1405,7 @@ async def test_random_alu_immediate_program(dut):
 
         for _ in range(4):
 
-            op = random.choice(
-                ops
-            )
+            op = random.choice(ops)
 
             b = random.randint(
                 0,
@@ -1457,19 +1430,13 @@ async def test_random_alu_immediate_program(dut):
                 ) & 0xFF
 
             elif op == OP_AND:
-                model = (
-                    model & b
-                )
+                model = model & b
 
             elif op == OP_OR:
-                model = (
-                    model | b
-                )
+                model = model | b
 
             elif op == OP_XOR:
-                model = (
-                    model ^ b
-                )
+                model = model ^ b
 
         program.append(
             enc(
@@ -1493,7 +1460,7 @@ async def test_random_alu_immediate_program(dut):
 
         await wait_for_halt(
             dut,
-            timeout_cycles=80
+            80
         )
 
         got = int(
