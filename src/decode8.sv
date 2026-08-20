@@ -54,12 +54,30 @@ module decode8 (
     localparam logic [2:0] ALU_INC = 3'b110;
     localparam logic [2:0] ALU_DEC = 3'b111;
 
+    // -----------------------------------------------------------
+    // Instruction field extraction.
+    //
+    // Done as continuous assigns to constant part-selects rather
+    // than inside the always_comb block below. Icarus Verilog
+    // does not fully support constant selects inside always_*
+    // processes ("sorry: constant selects in always_* processes
+    // are not currently supported (all bits will be included)"),
+    // which can silently substitute the whole 8-bit instruction
+    // for what should be a 4-bit slice. Slicing here, outside the
+    // process, avoids relying on that unsupported behavior.
+    // -----------------------------------------------------------
+    logic [3:0] opcode_bits;
+    logic [3:0] operand_bits;
+
+    assign opcode_bits  = instruction[7:4];
+    assign operand_bits = instruction[3:0];
+
     // Decode instruction
     always_comb begin
 
         // Extract instruction fields
-        opcode  = instruction[7:4];
-        operand = instruction[3:0];
+        opcode  = opcode_bits;
+        operand = operand_bits;
 
         // Default values
         reg_write       = 1'b0;
@@ -74,7 +92,7 @@ module decode8 (
 
         halt            = 1'b0;
 
-        case (instruction[7:4])
+        case (opcode_bits)
 
             // -------------------------
             // No operation
