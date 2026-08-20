@@ -21,7 +21,12 @@ module cpu8 (
     // Only 4 bits wide -- this drives uio_out[7:4] directly in
     // tt_um_mcu8.sv. uio_oe is hardwired there separately and
     // does not depend on this register.
-    output logic [3:0] uio_store
+    output logic [3:0] uio_store,
+
+    // Fixed uio input port, read via LOAD 0xD.
+    // Corresponds to uio_in[3:1] (uio_in[0] is UART RX, never
+    // exposed to software).
+    input logic [2:0] uio_general_in
 
 );
 
@@ -498,6 +503,13 @@ module cpu8 (
                         if (operand == 4'hE) begin
 
                             accumulator <= gpio_read_data;
+
+                        end
+
+                        // uio general-purpose inputs (uio_in[3:1])
+                        else if (operand == 4'hD) begin
+
+                            accumulator <= {5'b00000, uio_general_in};
 
                         end
 
