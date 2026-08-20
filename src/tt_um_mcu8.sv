@@ -24,9 +24,9 @@ module tt_um_cpu8 (
     wire start_cpu;
 
     // Value written via STORE 0xD (the fixed uio output port).
-    // Only 4 bits -- this is the upper nibble of the accumulator,
-    // driving the only output-direction half of the fixed
-    // 4-out/4-in uio split.
+    // Only 4 bits -- this is the lower nibble of the accumulator
+    // (what LDI actually loads), driving the only output-direction
+    // half of the fixed 4-out/4-in uio split.
     wire [3:0] uio_store_data;
 
     // =========================================================
@@ -76,7 +76,9 @@ module tt_um_cpu8 (
 
         .gpio_oe(),
 
-        .uio_store(uio_store_data)
+        .uio_store(uio_store_data),
+
+        .uio_general_in(uio_in[3:1])
 
     );
 
