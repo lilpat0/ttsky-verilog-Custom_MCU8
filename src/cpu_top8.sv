@@ -18,9 +18,10 @@ module cpu8 (
     output logic [7:0] gpio_oe,
 
     // Fixed uio output port (value written via STORE 0xD).
-    // Routed to uio_out[7:4] in tt_um_mcu8.sv; uio_oe is
-    // hardwired there and does not depend on this register.
-    output logic [7:0] uio_out_reg
+    // Only 4 bits wide -- this drives uio_out[7:4] directly in
+    // tt_um_mcu8.sv. uio_oe is hardwired there separately and
+    // does not depend on this register.
+    output logic [3:0] uio_store
 
 );
 
@@ -215,15 +216,9 @@ module cpu8 (
         .gpio_in(gpio_in),
 
         .gpio_out(gpio_out),
-        .gpio_oe(uio_out_reg)
+        .gpio_oe(gpio_oe)
 
     );
-
-    // gpio_oe is not used by this design (the physical uio
-    // pins have a fixed direction split, hardwired in
-    // tt_um_mcu8.sv), so tie it off here to avoid an
-    // undriven output port.
-    assign gpio_oe = 8'h00;
 
     // =========================================================
     // GPIO access control
@@ -247,13 +242,8 @@ module cpu8 (
 
             end
 
-            // STORE D = GPIO direction
-            else if (mem_write && (operand == 4'hD)) begin
-
-                gpio_we      = 1'b1;
-                gpio_address = 2'b01;
-
-            end
+            // STORE D is handled by the dedicated uio_store
+            // register below, not by the gpio8 peripheral.
 
             // LOAD E = GPIO input
             else if (mem_read && (operand == 4'hE)) begin
@@ -262,6 +252,37 @@ module cpu8 (
                 gpio_address = 2'b10;
 
             end
+
+        end
+
+    end
+
+    // =========================================================
+    // Fixed uio output port (STORE 0xD)
+    //
+    // Dedicated register, independent of the gpio8 peripheral.
+    // Only the accumulator's upper nibble is kept, since only
+    // uio_out[7:4] is wired as an output in tt_um_mcu8.sv.
+    // =========================================================
+
+    always_ff @(posedge clk or negedge rst_n) begin
+
+        if (!rst_n) begin
+
+            uio_store <= 4'h0;
+
+        end
+
+        else if (!ena) begin
+
+            uio_store <= 4'h0;
+
+        end
+
+        else if (ena && running && !halted &&
+                  mem_write && (operand == 4'hD)) begin
+
+            uio_store <= accumulator[7:4];
 
         end
 
