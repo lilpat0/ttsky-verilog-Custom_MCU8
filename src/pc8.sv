@@ -2,9 +2,15 @@ module pc8 (
 
     input logic clk,
     input logic rst_n,
+    input logic ena,
 
     // CPU start/restart
     input logic start_cpu,
+
+    // Freeze the PC while the CPU is halted (chip still enabled,
+    // execution stopped). Keeps PC parked at the halt address
+    // instead of free-running through instruction memory.
+    input logic halted,
 
     // Branch/jump
     input logic branch_taken,
@@ -49,9 +55,22 @@ module pc8 (
 
         end
 
+        else if (!ena) begin
+
+            pc <= 8'h00;
+
+        end
+
         else if (start_cpu) begin
 
             pc <= 8'h00;
+
+        end
+
+        else if (halted) begin
+
+            // Hold: don't keep fetching past a HALT.
+            pc <= pc;
 
         end
 
