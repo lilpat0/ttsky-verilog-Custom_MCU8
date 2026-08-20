@@ -15,7 +15,12 @@ module cpu8 (
     // GPIO
     input logic [7:0] gpio_in,
     output logic [7:0] gpio_out,
-    output logic [7:0] gpio_oe
+    output logic [7:0] gpio_oe,
+
+    // Fixed uio output port (value written via STORE 0xD).
+    // Routed to uio_out[7:4] in tt_um_mcu8.sv; uio_oe is
+    // hardwired there and does not depend on this register.
+    output logic [7:0] uio_out_reg
 
 );
 
@@ -132,7 +137,7 @@ module cpu8 (
     // =========================================================
 
     logic ram_we;
-    logic [3:0] ram_address;
+    logic [4:0] ram_address;
 
     logic [7:0] ram_write_data;
     logic [7:0] ram_read_data;
@@ -210,9 +215,15 @@ module cpu8 (
         .gpio_in(gpio_in),
 
         .gpio_out(gpio_out),
-        .gpio_oe(gpio_oe)
+        .gpio_oe(uio_out_reg)
 
     );
+
+    // gpio_oe is not used by this design (the physical uio
+    // pins have a fixed direction split, hardwired in
+    // tt_um_mcu8.sv), so tie it off here to avoid an
+    // undriven output port.
+    assign gpio_oe = 8'h00;
 
     // =========================================================
     // GPIO access control
