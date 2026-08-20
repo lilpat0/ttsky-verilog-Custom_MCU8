@@ -250,17 +250,19 @@ module cpu8 (
             // STORE D is handled by the dedicated uio_store
             // register below, not by the gpio8 peripheral.
 
-            // LOAD C = read back GPIO output register.
-            // Symmetric with STORE C above -- without this, LOAD
-            // 0xC silently fell through to an unrelated RAM
-            // location that could never be written (STORE 0xC is
-            // always intercepted for GPIO), so it always read 0.
-            else if (mem_read && (operand == 4'hC)) begin
-
-                gpio_re      = 1'b1;
-                gpio_address = 2'b00;
-
-            end
+            // NOTE: LOAD 0xC is intentionally NOT special-cased
+            // here. Per the ISA, only 0xD and 0xE are special
+            // for LOAD -- LOAD 0xC must fall through to a plain
+            // RAM read (see RAM write control above: STORE 0xC
+            // is intercepted for GPIO, so RAM[0xC] can never be
+            // written by software and reads back whatever RAM
+            // powers up with). A LOAD-0xC special case was
+            // previously added here under the mistaken belief
+            // that this was a bug; it broke the documented
+            // isolation between LOAD 0xC and the GPIO output
+            // register (LOAD 0xC ended up echoing whatever was
+            // just STOREd to 0xC instead of reading RAM). Do not
+            // re-add it.
 
             // LOAD E = GPIO input
             else if (mem_read && (operand == 4'hE)) begin
@@ -513,8 +515,10 @@ module cpu8 (
 
                     if (mem_read) begin
 
-                        // GPIO output register readback / GPIO input
-                        if ((operand == 4'hC) || (operand == 4'hE)) begin
+                        // GPIO input (LOAD 0xE only -- LOAD 0xC is
+                        // NOT special-cased; it falls through to
+                        // the RAM read in the else branch below).
+                        if (operand == 4'hE) begin
 
                             accumulator <= gpio_read_data;
 
@@ -527,7 +531,9 @@ module cpu8 (
 
                         end
 
-                        // RAM
+                        // RAM (includes operand == 4'hC, which is
+                        // unwritable via STORE but still a plain
+                        // RAM read on LOAD per the ISA)
                         else begin
 
                             accumulator <= ram_read_data;
