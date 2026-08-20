@@ -261,8 +261,10 @@ module cpu8 (
     // Fixed uio output port (STORE 0xD)
     //
     // Dedicated register, independent of the gpio8 peripheral.
-    // Only the accumulator's upper nibble is kept, since only
-    // uio_out[7:4] is wired as an output in tt_um_mcu8.sv.
+    // Uses the accumulator's LOWER nibble -- this is the nibble
+    // LDI actually loads (accumulator <= {4'b0000, operand}),
+    // so a simple "LDI <val>; STORE 0xD" puts <val> directly on
+    // uio_out[7:4].
     // =========================================================
 
     always_ff @(posedge clk or negedge rst_n) begin
@@ -282,7 +284,7 @@ module cpu8 (
         else if (ena && running && !halted &&
                   mem_write && (operand == 4'hD)) begin
 
-            uio_store <= accumulator[7:4];
+            uio_store <= accumulator[3:0];
 
         end
 
