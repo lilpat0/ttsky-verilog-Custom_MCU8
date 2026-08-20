@@ -143,7 +143,7 @@ module cpu8 (
     // =========================================================
 
     logic ram_we;
-    logic [4:0] ram_address;
+    logic [3:0] ram_address;
 
     logic [7:0] ram_write_data;
     logic [7:0] ram_read_data;
@@ -170,7 +170,7 @@ module cpu8 (
     always_comb begin
 
         ram_we         = 1'b0;
-        ram_address    = {1'b0, operand};
+        ram_address    = operand;
         ram_write_data = accumulator;
 
         if (ena && running && !halted && mem_write) begin
@@ -250,6 +250,18 @@ module cpu8 (
             // STORE D is handled by the dedicated uio_store
             // register below, not by the gpio8 peripheral.
 
+            // LOAD C = read back GPIO output register.
+            // Symmetric with STORE C above -- without this, LOAD
+            // 0xC silently fell through to an unrelated RAM
+            // location that could never be written (STORE 0xC is
+            // always intercepted for GPIO), so it always read 0.
+            else if (mem_read && (operand == 4'hC)) begin
+
+                gpio_re      = 1'b1;
+                gpio_address = 2'b00;
+
+            end
+
             // LOAD E = GPIO input
             else if (mem_read && (operand == 4'hE)) begin
 
@@ -303,8 +315,10 @@ module cpu8 (
 
         .clk(clk),
         .rst_n(rst_n),
+        .ena(ena),
 
         .start_cpu(start_cpu),
+        .halted(halted),
 
         .branch_taken(branch_taken),
         .jump_taken(jump_taken),
@@ -499,8 +513,8 @@ module cpu8 (
 
                     if (mem_read) begin
 
-                        // GPIO input
-                        if (operand == 4'hE) begin
+                        // GPIO output register readback / GPIO input
+                        if ((operand == 4'hC) || (operand == 4'hE)) begin
 
                             accumulator <= gpio_read_data;
 
