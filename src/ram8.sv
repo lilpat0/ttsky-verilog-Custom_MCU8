@@ -13,12 +13,6 @@ module ram8 (
 
     integer i;
 
-    // Initialize RAM to zero for simulation
-    initial begin
-        for (i = 0; i < 16; i = i + 1)
-            memory[i] = 8'h00;
-    end
-
     // Asynchronous read
     always_comb begin
         if (!rst_n)
@@ -27,10 +21,18 @@ module ram8 (
             read_data = memory[address];
     end
 
-    // Synchronous write
+    // Synchronous reset and write
     always_ff @(posedge clk) begin
-        if (rst_n && we)
+        if (!rst_n) begin
+            // Explicitly clear all RAM locations on reset.
+            // This avoids relying on 'initial' simulation-only
+            // initialization for deterministic post-reset state.
+            for (i = 0; i < 16; i = i + 1)
+                memory[i] <= 8'h00;
+        end
+        else if (we) begin
             memory[address] <= write_data;
+        end
     end
 
 endmodule
