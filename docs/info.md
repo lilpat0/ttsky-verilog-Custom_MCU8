@@ -41,7 +41,7 @@ The remaining RAM addresses are available for normal data storage.
 
 ## How to test
 
-The CPU can be tested by connecting a UART interface to the programming input and sending 8-bit UART data using an 8-N-1 configuration.
+The CPU can be tested by connecting a UART interface to the programming input and sending 8-bit UART data using an 8-N-1 configuration (please clk at 60 mhz ~16.67ns).
 
 The programming protocol is:
 
