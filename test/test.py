@@ -6,7 +6,7 @@ Physical-pin-only testbench.
 UART programming protocol:
 
     0xAA <addr> <data>   -> write instruction memory
-    0x55                 -> start/restart CPU
+    0x55                -> start/restart CPU
 
 Physical UIO mapping:
 
@@ -18,6 +18,10 @@ Physical UIO mapping:
     uio_out[3:0] = 0
 
     uio_oe = 8'hF0
+
+Interrupt vector:
+
+    0x10
 """
 
 import random
@@ -82,8 +86,10 @@ GPIO_OUT_ADDR = 0xC
 UIO_ADDR      = 0xD
 GPIO_IN_ADDR  = 0xE
 
+INTERRUPT_VECTOR = 0x10
 
-def enc(opcode, operand):
+
+def enc(opcode, operand=0):
     assert 0 <= opcode <= 0xF
     assert 0 <= operand <= 0xF
 
@@ -91,7 +97,7 @@ def enc(opcode, operand):
 
 
 # ============================================================================
-# UART
+# CLOCK / UART
 # ============================================================================
 
 CLK_FREQ = 60_000_000
@@ -99,6 +105,24 @@ BAUD_RATE = 115200
 
 CLKS_PER_BIT = CLK_FREQ // BAUD_RATE
 CLKS_PER_BYTE = CLKS_PER_BIT * 10
+
+# Prevent reset_dut() from creating multiple clocks during tests
+_clock_started = False
+
+
+async def start_clock(dut):
+    global _clock_started
+
+    if not _clock_started:
+        _clock_started = True
+
+        cocotb.start_soon(
+            Clock(
+                dut.clk,
+                1e9 / CLK_FREQ,
+                unit="ns",
+            ).start()
+        )
 
 
 class UartProgrammer:
@@ -117,7 +141,6 @@ class UartProgrammer:
     def _drive_rx(self, bit):
         """
         Change ONLY uio_in[0].
-
         Preserve uio_in[7:1].
         """
 
@@ -178,11 +201,11 @@ class UartProgrammer:
 
     async def load_program(self, instructions, start_addr=0):
 
-        for offset, instr in enumerate(instructions):
+        for offset, instruction in enumerate(instructions):
 
             await self.program(
                 start_addr + offset,
-                instr
+                instruction
             )
 
     async def start_cpu(self):
@@ -203,10 +226,8 @@ def drive_uio_general_inputs(dut, bits3to1):
 
     Mapping:
 
-        uio_in[3:1] = bits3to1
-        uio_in[0]   = UART idle-high
-
-    Bits [7:4] remain zero.
+        uio_in[0]   = UART RX
+        uio_in[3:1] = general-purpose inputs
 
     Example:
 
@@ -221,18 +242,10 @@ def drive_uio_general_inputs(dut, bits3to1):
 
     value = ((bits3to1 & 0x7) << 1) | 0x01
 
-    # Drive the entire physical input bus.
     dut.uio_in.value = value
 
 
 async def set_uio_general_inputs(dut, bits3to1):
-    """
-    Drive UIO inputs and allow the new value to propagate.
-
-    This deliberately does NOT assert the value immediately after
-    assignment.  The physical UIO bus is treated as an input pin bus,
-    so we give the simulator one clock edge to settle.
-    """
 
     drive_uio_general_inputs(
         dut,
@@ -249,25 +262,16 @@ async def set_uio_general_inputs(dut, bits3to1):
 # RESET
 # ============================================================================
 
-async def reset_dut(dut, clk_period_ns=10):
+async def reset_dut(dut):
     """
-    Reset the DUT and start the clock.
+    Reset the DUT.
 
-    uio_in is initialized to:
-
-        uio_in[0] = 1
-        uio_in[7:1] = 0
+    Clock is started only once for the entire simulation.
     """
 
     _assert_pin_only_access(dut)
 
-    cocotb.start_soon(
-        Clock(
-            dut.clk,
-            clk_period_ns,
-            unit="ns",
-        ).start()
-    )
+    await start_clock(dut)
 
     dut.ena.value = 1
     dut.ui_in.value = 0
@@ -295,7 +299,7 @@ async def reset_dut(dut, clk_period_ns=10):
         CLKS_PER_BIT * 2
     )
 
-    # Restore UART idle while keeping all general inputs at zero.
+    # Restore UART idle while keeping general inputs at zero.
     dut.uio_in.value = 0x01
 
     await ClockCycles(
@@ -339,7 +343,7 @@ async def wait_for_halt(
     """
     HALT is not externally visible.
 
-    Wait long enough for the known test program to finish.
+    Wait long enough for the test program to finish.
     """
 
     await ClockCycles(
@@ -384,7 +388,7 @@ async def test_ldi_add_store(dut):
         enc(OP_LDI, 5),
         enc(OP_ADD, 3),
         enc(OP_STORE, GPIO_OUT_ADDR),
-        enc(OP_HALT, 0),
+        enc(OP_HALT),
     ]
 
     await run_program(
@@ -444,7 +448,7 @@ async def test_alu_ops(dut):
         (OP_SUB, 9, 4),
         (OP_SUB, 2, 5),
         (OP_AND, 0b1100, 0b1010),
-        (OP_OR, 0b1100, 0b0011),
+        (OP_OR,  0b1100, 0b0011),
         (OP_XOR, 0b1111, 0b1010),
         (OP_NOT, 0b1010, 0),
         (OP_INC, 7, 0),
@@ -459,7 +463,7 @@ async def test_alu_ops(dut):
             enc(OP_LDI, a & 0xF),
             enc(op, b & 0xF),
             enc(OP_STORE, GPIO_OUT_ADDR),
-            enc(OP_HALT, 0),
+            enc(OP_HALT),
         ]
 
         await run_program(
@@ -488,6 +492,145 @@ async def test_alu_ops(dut):
 
 
 # ============================================================================
+# INDIVIDUAL ALU TESTS
+# ============================================================================
+
+async def alu_test(dut, name, opcode, a, b, expected):
+
+    uart = await reset_dut(dut)
+
+    program = [
+        enc(OP_LDI, a & 0xF),
+        enc(opcode, b & 0xF),
+        enc(OP_STORE, GPIO_OUT_ADDR),
+        enc(OP_HALT),
+    ]
+
+    await run_program(
+        dut,
+        uart,
+        program
+    )
+
+    await wait_for_halt(
+        dut,
+        50
+    )
+
+    result = int(dut.uo_out.value)
+
+    assert result == (expected & 0xFF), (
+        f"{name}: expected "
+        f"0x{expected & 0xFF:02X}, "
+        f"got 0x{result:02X}"
+    )
+
+
+@cocotb.test()
+async def test_add(dut):
+
+    await alu_test(
+        dut,
+        "ADD",
+        OP_ADD,
+        5,
+        3,
+        8
+    )
+
+
+@cocotb.test()
+async def test_sub(dut):
+
+    await alu_test(
+        dut,
+        "SUB",
+        OP_SUB,
+        9,
+        4,
+        5
+    )
+
+
+@cocotb.test()
+async def test_and(dut):
+
+    await alu_test(
+        dut,
+        "AND",
+        OP_AND,
+        12,
+        10,
+        8
+    )
+
+
+@cocotb.test()
+async def test_or(dut):
+
+    await alu_test(
+        dut,
+        "OR",
+        OP_OR,
+        12,
+        3,
+        15
+    )
+
+
+@cocotb.test()
+async def test_xor(dut):
+
+    await alu_test(
+        dut,
+        "XOR",
+        OP_XOR,
+        15,
+        10,
+        5
+    )
+
+
+@cocotb.test()
+async def test_not(dut):
+
+    await alu_test(
+        dut,
+        "NOT",
+        OP_NOT,
+        10,
+        0,
+        0xF5
+    )
+
+
+@cocotb.test()
+async def test_inc(dut):
+
+    await alu_test(
+        dut,
+        "INC",
+        OP_INC,
+        7,
+        0,
+        8
+    )
+
+
+@cocotb.test()
+async def test_dec(dut):
+
+    await alu_test(
+        dut,
+        "DEC",
+        OP_DEC,
+        7,
+        0,
+        6
+    )
+
+
+# ============================================================================
 # RAM
 # ============================================================================
 
@@ -504,7 +647,7 @@ async def test_ram_load_store(dut):
         enc(OP_LDI, 0),
         enc(OP_LOAD, ram_addr),
         enc(OP_STORE, GPIO_OUT_ADDR),
-        enc(OP_HALT, 0),
+        enc(OP_HALT),
     ]
 
     await run_program(
@@ -519,6 +662,94 @@ async def test_ram_load_store(dut):
     )
 
     assert dut.uo_out.value == 9
+
+
+# ============================================================================
+# RAM ADDRESS SWEEP
+# ============================================================================
+
+@cocotb.test()
+async def test_ram_address_sweep(dut):
+
+    ram_addrs = [
+        a
+        for a in range(16)
+        if a not in (
+            GPIO_OUT_ADDR,
+            UIO_ADDR,
+            GPIO_IN_ADDR,
+        )
+    ]
+
+    for addr in ram_addrs:
+
+        value = (
+            (addr * 7 + 3)
+            & 0xFF
+            & 0xF
+        )
+
+        uart = await reset_dut(dut)
+
+        program = [
+            enc(OP_LDI, value),
+            enc(OP_STORE, addr),
+            enc(OP_LDI, 0),
+            enc(OP_LOAD, addr),
+            enc(OP_STORE, GPIO_OUT_ADDR),
+            enc(OP_HALT),
+        ]
+
+        await run_program(
+            dut,
+            uart,
+            program
+        )
+
+        await wait_for_halt(
+            dut,
+            50
+        )
+
+        got = int(dut.uo_out.value)
+
+        assert got == value, (
+            f"RAM addr {addr:#x}: "
+            f"expected {value}, got {got}"
+        )
+
+
+# ============================================================================
+# GPIO OUTPUT
+# ============================================================================
+
+@cocotb.test()
+async def test_gpio_output(dut):
+
+    uart = await reset_dut(dut)
+
+    program = [
+        enc(OP_LDI, 5),
+        enc(OP_STORE, GPIO_OUT_ADDR),
+        enc(OP_HALT),
+    ]
+
+    await run_program(
+        dut,
+        uart,
+        program
+    )
+
+    await wait_for_halt(
+        dut,
+        50
+    )
+
+    result = int(dut.uo_out.value)
+
+    assert result == 5, (
+        f"GPIO output wrong: got 0x{result:02X}"
+    )
 
 
 # ============================================================================
@@ -537,7 +768,7 @@ async def test_gpio_input_passthrough(dut):
     program = [
         enc(OP_LOAD, GPIO_IN_ADDR),
         enc(OP_STORE, GPIO_OUT_ADDR),
-        enc(OP_HALT, 0),
+        enc(OP_HALT),
     ]
 
     await run_program(
@@ -555,6 +786,186 @@ async def test_gpio_input_passthrough(dut):
 
 
 # ============================================================================
+# LIVE GPIO INPUT
+# ============================================================================
+
+@cocotb.test()
+async def test_gpio_input_tracks_live_changes(dut):
+
+    program = [
+        enc(OP_LOAD, GPIO_IN_ADDR),
+        enc(OP_STORE, GPIO_OUT_ADDR),
+        enc(OP_HALT),
+    ]
+
+    uart = await reset_dut(dut)
+
+    dut.ui_in.value = 0x3C
+
+    await run_program(
+        dut,
+        uart,
+        program
+    )
+
+    await wait_for_halt(
+        dut,
+        50
+    )
+
+    assert dut.uo_out.value == 0x3C
+
+    uart = await reset_dut(dut)
+
+    dut.ui_in.value = 0xC3
+
+    await run_program(
+        dut,
+        uart,
+        program
+    )
+
+    await wait_for_halt(
+        dut,
+        50
+    )
+
+    assert dut.uo_out.value == 0xC3
+
+
+# ============================================================================
+# UIO INPUT
+# ============================================================================
+
+@cocotb.test()
+async def test_uio_input_passthrough(dut):
+
+    test_values = [
+        0b000,
+        0b001,
+        0b010,
+        0b011,
+        0b100,
+        0b101,
+        0b110,
+        0b111,
+    ]
+
+    for value in test_values:
+
+        uart = await reset_dut(dut)
+
+        await set_uio_general_inputs(
+            dut,
+            value
+        )
+
+        actual = int(dut.uio_in.value)
+
+        assert ((actual >> 1) & 0x7) == value, (
+            "UIO input pins did not retain requested value: "
+            f"requested={value:03b}, "
+            f"uio_in={actual:#04x}"
+        )
+
+        assert (actual & 0x1) == 1, (
+            "UART RX must remain idle-high; "
+            f"uio_in={actual:#04x}"
+        )
+
+        program = [
+            enc(OP_LOAD, UIO_ADDR),
+            enc(OP_STORE, GPIO_OUT_ADDR),
+            enc(OP_HALT),
+        ]
+
+        await run_program(
+            dut,
+            uart,
+            program
+        )
+
+        await wait_for_halt(
+            dut,
+            50
+        )
+
+        got = int(dut.uo_out.value)
+
+        assert got == value, (
+            f"UIO input {value:03b}: "
+            f"expected uo_out={value:#04x}, "
+            f"got {got:#04x}"
+        )
+
+
+# ============================================================================
+# UIO OUTPUT
+# ============================================================================
+
+@cocotb.test()
+async def test_uio_output(dut):
+
+    uart = await reset_dut(dut)
+
+    program = [
+        enc(OP_LDI, 0xF),
+        enc(OP_STORE, UIO_ADDR),
+        enc(OP_HALT),
+    ]
+
+    await run_program(
+        dut,
+        uart,
+        program
+    )
+
+    await wait_for_halt(
+        dut,
+        50
+    )
+
+    result = int(dut.uio_out.value)
+
+    assert (result & 0xF0) == 0xF0, (
+        f"UIO output wrong: got 0x{result:02X}"
+    )
+
+
+@cocotb.test()
+async def test_uio_store_isolated_from_gpio_out(dut):
+
+    uart = await reset_dut(dut)
+
+    program = [
+        enc(OP_LDI, 4),
+        enc(OP_STORE, GPIO_OUT_ADDR),
+
+        enc(OP_LDI, 0xF),
+        enc(OP_STORE, UIO_ADDR),
+
+        enc(OP_HALT),
+    ]
+
+    await run_program(
+        dut,
+        uart,
+        program
+    )
+
+    await wait_for_halt(
+        dut,
+        50
+    )
+
+    assert dut.uo_out.value == 4
+
+    assert (
+        (int(dut.uio_out.value) >> 4) == 0xF
+    )
+
+
+# ============================================================================
 # JMP
 # ============================================================================
 
@@ -567,9 +978,9 @@ async def test_jmp(dut):
         enc(OP_LDI, 1),
         enc(OP_JMP, 4),
         enc(OP_LDI, 0xF),
-        enc(OP_HALT, 0),
+        enc(OP_HALT),
         enc(OP_STORE, GPIO_OUT_ADDR),
-        enc(OP_HALT, 0),
+        enc(OP_HALT),
     ]
 
     await run_program(
@@ -599,9 +1010,9 @@ async def test_branch_zero_taken(dut):
         enc(OP_LDI, 0),
         enc(OP_BZ, 4),
         enc(OP_LDI, 0xF),
-        enc(OP_HALT, 0),
+        enc(OP_HALT),
         enc(OP_STORE, GPIO_OUT_ADDR),
-        enc(OP_HALT, 0),
+        enc(OP_HALT),
     ]
 
     await run_program(
@@ -632,7 +1043,7 @@ async def test_branch_zero_not_taken(dut):
         enc(OP_BZ, 5),
         enc(OP_LDI, 7),
         enc(OP_STORE, GPIO_OUT_ADDR),
-        enc(OP_HALT, 0),
+        enc(OP_HALT),
         enc(OP_STORE, GPIO_OUT_ADDR),
     ]
 
@@ -651,7 +1062,7 @@ async def test_branch_zero_not_taken(dut):
 
 
 # ============================================================================
-# BNZ
+# BNZ TAKEN / NOT TAKEN
 # ============================================================================
 
 @cocotb.test()
@@ -663,9 +1074,9 @@ async def test_branch_not_zero(dut):
         enc(OP_LDI, 3),
         enc(OP_BNZ, 4),
         enc(OP_LDI, 0xF),
-        enc(OP_HALT, 0),
+        enc(OP_HALT),
         enc(OP_STORE, GPIO_OUT_ADDR),
-        enc(OP_HALT, 0),
+        enc(OP_HALT),
     ]
 
     await run_program(
@@ -694,7 +1105,7 @@ async def test_halt_freezes_accumulator(dut):
     program = [
         enc(OP_LDI, 4),
         enc(OP_STORE, GPIO_OUT_ADDR),
-        enc(OP_HALT, 0),
+        enc(OP_HALT),
         enc(OP_LDI, 0xF),
         enc(OP_STORE, GPIO_OUT_ADDR),
     ]
@@ -732,7 +1143,7 @@ async def test_ena_gating(dut):
     program = [
         enc(OP_LDI, 6),
         enc(OP_STORE, GPIO_OUT_ADDR),
-        enc(OP_HALT, 0),
+        enc(OP_HALT),
     ]
 
     await uart.load_program(program)
@@ -776,10 +1187,10 @@ async def test_nop(dut):
 
     program = [
         enc(OP_LDI, 6),
-        enc(OP_NOP, 0),
-        enc(OP_NOP, 0),
+        enc(OP_NOP),
+        enc(OP_NOP),
         enc(OP_STORE, GPIO_OUT_ADDR),
-        enc(OP_HALT, 0),
+        enc(OP_HALT),
     ]
 
     await run_program(
@@ -797,232 +1208,6 @@ async def test_nop(dut):
 
 
 # ============================================================================
-# RAM ADDRESS SWEEP
-# ============================================================================
-
-@cocotb.test()
-async def test_ram_address_sweep(dut):
-
-    ram_addrs = [
-        a
-        for a in range(16)
-        if a not in (
-            GPIO_OUT_ADDR,
-            UIO_ADDR,
-            GPIO_IN_ADDR,
-        )
-    ]
-
-    for addr in ram_addrs:
-
-        value = (
-            (addr * 7 + 3)
-            & 0xFF
-            & 0xF
-        )
-
-        uart = await reset_dut(dut)
-
-        program = [
-            enc(OP_LDI, value),
-            enc(OP_STORE, addr),
-            enc(OP_LDI, 0),
-            enc(OP_LOAD, addr),
-            enc(OP_STORE, GPIO_OUT_ADDR),
-            enc(OP_HALT, 0),
-        ]
-
-        await run_program(
-            dut,
-            uart,
-            program
-        )
-
-        await wait_for_halt(
-            dut,
-            50
-        )
-
-        got = int(dut.uo_out.value)
-
-        assert got == value, (
-            f"RAM addr {addr:#x}: "
-            f"expected {value}, got {got}"
-        )
-
-
-# ============================================================================
-# UIO INPUT
-# ============================================================================
-
-@cocotb.test()
-async def test_uio_input_passthrough(dut):
-    """
-    LOAD 0xD reads uio_in[3:1].
-
-    Physical mapping:
-
-        uio_in[0]   = UART RX
-        uio_in[3:1] = general-purpose inputs
-
-    The CPU exposes the three UIO input bits as the
-    low three bits of the accumulator.
-    """
-
-    test_values = [
-        0b000,
-        0b001,
-        0b010,
-        0b011,
-        0b100,
-        0b101,
-        0b110,
-        0b111,
-    ]
-
-    for value in test_values:
-
-        uart = await reset_dut(dut)
-
-        # ------------------------------------------------------------
-        # IMPORTANT FIX:
-        #
-        # Drive UIO inputs AFTER reset and allow one clock cycle for
-        # the physical input bus to settle.
-        # ------------------------------------------------------------
-
-        await set_uio_general_inputs(
-            dut,
-            value
-        )
-
-        # Verify only after the simulator has had a chance to settle.
-        actual = int(dut.uio_in.value)
-
-        assert ((actual >> 1) & 0x7) == value, (
-            "UIO input pins did not retain requested value: "
-            f"requested={value:03b}, "
-            f"uio_in={actual:#04x}"
-        )
-
-        # UART RX must remain idle-high.
-        assert (actual & 0x1) == 1, (
-            "UART RX must remain idle-high; "
-            f"uio_in={actual:#04x}"
-        )
-
-        program = [
-            enc(OP_LOAD, UIO_ADDR),
-            enc(OP_STORE, GPIO_OUT_ADDR),
-            enc(OP_HALT, 0),
-        ]
-
-        await run_program(
-            dut,
-            uart,
-            program
-        )
-
-        await wait_for_halt(
-            dut,
-            50
-        )
-
-        got = int(dut.uo_out.value)
-
-        assert got == value, (
-            f"UIO input {value:03b}: "
-            f"expected uo_out={value:#04x}, "
-            f"got {got:#04x}"
-        )
-
-
-# ============================================================================
-# UIO OUTPUT
-# ============================================================================
-
-@cocotb.test()
-async def test_uio_store_isolated_from_gpio_out(dut):
-
-    uart = await reset_dut(dut)
-
-    program = [
-        enc(OP_LDI, 4),
-        enc(OP_STORE, GPIO_OUT_ADDR),
-
-        enc(OP_LDI, 0xF),
-        enc(OP_STORE, UIO_ADDR),
-
-        enc(OP_HALT, 0),
-    ]
-
-    await run_program(
-        dut,
-        uart,
-        program
-    )
-
-    await wait_for_halt(
-        dut,
-        50
-    )
-
-    assert dut.uo_out.value == 4
-
-    assert (
-        (int(dut.uio_out.value) >> 4) == 0xF
-    )
-
-
-# ============================================================================
-# LIVE GPIO INPUT
-# ============================================================================
-
-@cocotb.test()
-async def test_gpio_input_tracks_live_changes(dut):
-
-    uart = await reset_dut(dut)
-
-    program = [
-        enc(OP_LOAD, GPIO_IN_ADDR),
-        enc(OP_STORE, GPIO_OUT_ADDR),
-        enc(OP_HALT, 0),
-    ]
-
-    dut.ui_in.value = 0x3C
-
-    await run_program(
-        dut,
-        uart,
-        program
-    )
-
-    await wait_for_halt(
-        dut,
-        50
-    )
-
-    assert dut.uo_out.value == 0x3C
-
-    uart = await reset_dut(dut)
-
-    dut.ui_in.value = 0xC3
-
-    await run_program(
-        dut,
-        uart,
-        program
-    )
-
-    await wait_for_halt(
-        dut,
-        50
-    )
-
-    assert dut.uo_out.value == 0xC3
-
-
-# ============================================================================
 # BACKWARD BRANCH LOOP
 # ============================================================================
 
@@ -1034,10 +1219,10 @@ async def test_backward_branch_loop(dut):
     program = [
         enc(OP_LDI, 3),
         enc(OP_STORE, GPIO_OUT_ADDR),
-        enc(OP_DEC, 0),
+        enc(OP_DEC),
         enc(OP_BNZ, 1),
         enc(OP_STORE, GPIO_OUT_ADDR),
-        enc(OP_HALT, 0),
+        enc(OP_HALT),
     ]
 
     await run_program(
@@ -1074,7 +1259,7 @@ async def test_uart_garbage_bytes_are_ignored(dut):
     program = [
         enc(OP_LDI, 2),
         enc(OP_STORE, GPIO_OUT_ADDR),
-        enc(OP_HALT, 0),
+        enc(OP_HALT),
     ]
 
     await run_program(
@@ -1103,7 +1288,7 @@ async def test_uart_reprogram_overwrites_instruction_memory(dut):
     program_a = [
         enc(OP_LDI, 1),
         enc(OP_STORE, GPIO_OUT_ADDR),
-        enc(OP_HALT, 0),
+        enc(OP_HALT),
     ]
 
     await run_program(
@@ -1122,7 +1307,7 @@ async def test_uart_reprogram_overwrites_instruction_memory(dut):
     program_b = [
         enc(OP_LDI, 9),
         enc(OP_STORE, GPIO_OUT_ADDR),
-        enc(OP_HALT, 0),
+        enc(OP_HALT),
     ]
 
     await uart.load_program(
@@ -1140,15 +1325,51 @@ async def test_uart_reprogram_overwrites_instruction_memory(dut):
 
 
 # ============================================================================
-# LONG-RUNNING RESTART TEST
+# CPU RESTART AFTER HALT
+# ============================================================================
+
+@cocotb.test()
+async def test_start_cpu_restarts_after_halt(dut):
+
+    uart = await reset_dut(dut)
+
+    program = [
+        enc(OP_LDI, 7),
+        enc(OP_STORE, GPIO_OUT_ADDR),
+        enc(OP_HALT),
+    ]
+
+    await run_program(
+        dut,
+        uart,
+        program
+    )
+
+    await wait_for_halt(
+        dut,
+        50
+    )
+
+    assert dut.uo_out.value == 7
+
+    await uart.start_cpu()
+
+    await ClockCycles(
+        dut.clk,
+        30
+    )
+
+    assert dut.uo_out.value == 7
+
+
+# ============================================================================
+# LONG-RUNNING LOOP PROGRAM
 # ============================================================================
 
 INNER_LOOP_NOP_COUNT = 24
 
 
-def build_interruptible_loop_program(
-    counter_ram_addr=0x5
-):
+def build_interruptible_loop_program(counter_ram_addr=0x5):
 
     program = []
 
@@ -1180,13 +1401,13 @@ def build_interruptible_loop_program(
     inner_start = addr()
 
     program.append(
-        enc(OP_DEC, 0)
+        enc(OP_DEC)
     )
 
     for _ in range(INNER_LOOP_NOP_COUNT):
 
         program.append(
-            enc(OP_NOP, 0)
+            enc(OP_NOP)
         )
 
     program.append(
@@ -1198,7 +1419,7 @@ def build_interruptible_loop_program(
     )
 
     program.append(
-        enc(OP_DEC, 0)
+        enc(OP_DEC)
     )
 
     program.append(
@@ -1214,14 +1435,14 @@ def build_interruptible_loop_program(
     )
 
     program.append(
-        enc(OP_HALT, 0)
+        enc(OP_HALT)
     )
 
     return program, outer_start
 
 
 # ============================================================================
-# RESTART MID-EXECUTION
+# RESTART MID EXECUTION
 # ============================================================================
 
 @cocotb.test()
@@ -1253,44 +1474,6 @@ async def test_start_cpu_restarts_mid_execution(dut):
         "restart should re-run from PC=0; "
         f"got {int(dut.uo_out.value)}"
     )
-
-
-# ============================================================================
-# RESTART AFTER HALT
-# ============================================================================
-
-@cocotb.test()
-async def test_start_cpu_restarts_after_halt(dut):
-
-    uart = await reset_dut(dut)
-
-    program = [
-        enc(OP_LDI, 7),
-        enc(OP_STORE, GPIO_OUT_ADDR),
-        enc(OP_HALT, 0),
-    ]
-
-    await run_program(
-        dut,
-        uart,
-        program
-    )
-
-    await wait_for_halt(
-        dut,
-        50
-    )
-
-    assert dut.uo_out.value == 7
-
-    await uart.start_cpu()
-
-    await ClockCycles(
-        dut.clk,
-        30
-    )
-
-    assert dut.uo_out.value == 7
 
 
 # ============================================================================
@@ -1379,8 +1562,7 @@ async def test_random_alu_immediate_program(dut):
 
         program.append(
             enc(
-                OP_HALT,
-                0
+                OP_HALT
             )
         )
 
@@ -1404,3 +1586,167 @@ async def test_random_alu_immediate_program(dut):
             f"expected {model}, got {got} "
             f"(program={[hex(i) for i in program]})"
         )
+
+
+# ============================================================================
+# INTERRUPT TEST
+# ============================================================================
+
+@cocotb.test()
+async def test_interrupt(dut):
+
+    uart = await reset_dut(dut)
+
+    # ------------------------------------------------------------
+    # Normal program
+    #
+    # 0: LDI 1
+    # 1: STORE GPIO
+    # 2: JMP 2
+    #
+    # Interrupt handler at 0x10:
+    #
+    # 16: LDI A
+    # 17: STORE GPIO
+    # 18: HALT
+    # ------------------------------------------------------------
+
+    program = [0] * 19
+
+    program[0] = enc(OP_LDI, 1)
+    program[1] = enc(OP_STORE, GPIO_OUT_ADDR)
+    program[2] = enc(OP_JMP, 2)
+
+    program[16] = enc(OP_LDI, 0xA)
+    program[17] = enc(OP_STORE, GPIO_OUT_ADDR)
+    program[18] = enc(OP_HALT)
+
+    await uart.load_program(
+        program
+    )
+
+    await uart.start_cpu()
+
+    # Allow normal program to run.
+    await ClockCycles(
+        dut.clk,
+        20
+    )
+
+    assert int(dut.uo_out.value) == 1, (
+        "Normal program did not execute"
+    )
+
+    # GPIO 0 -> 1.
+    dut.ui_in.value = 0x01
+
+    # Give interrupt detector a clock.
+    await ClockCycles(
+        dut.clk,
+        1
+    )
+
+    # Wait for handler.
+    await ClockCycles(
+        dut.clk,
+        40
+    )
+
+    result = int(dut.uo_out.value)
+
+    assert result == 0xA, (
+        f"Interrupt handler failed: got 0x{result:02X}"
+    )
+
+
+# ============================================================================
+# INTERRUPT MULTIPLE GPIO SOURCES
+# ============================================================================
+
+@cocotb.test()
+async def test_interrupt_multiple_gpio_sources(dut):
+
+    uart = await reset_dut(dut)
+
+    program = [0] * 19
+
+    # Normal program.
+    program[0] = enc(OP_LDI, 1)
+    program[1] = enc(OP_STORE, GPIO_OUT_ADDR)
+    program[2] = enc(OP_JMP, 2)
+
+    # Interrupt handler.
+    program[16] = enc(OP_LDI, 0xF)
+    program[17] = enc(OP_STORE, GPIO_OUT_ADDR)
+    program[18] = enc(OP_HALT)
+
+    await uart.load_program(
+        program
+    )
+
+    await uart.start_cpu()
+
+    await ClockCycles(
+        dut.clk,
+        20
+    )
+
+    assert dut.uo_out.value == 1
+
+    # Raise multiple GPIO inputs simultaneously.
+    dut.ui_in.value = 0b10101010
+
+    await ClockCycles(
+        dut.clk,
+        1
+    )
+
+    await ClockCycles(
+        dut.clk,
+        40
+    )
+
+    result = int(dut.uo_out.value)
+
+    assert result == 0xF, (
+        f"Multiple GPIO interrupt test failed: "
+        f"0x{result:02X}"
+    )
+
+
+# ============================================================================
+# FULL CPU SMOKE TEST
+# ============================================================================
+
+@cocotb.test()
+async def test_full_cpu_smoke(dut):
+
+    uart = await reset_dut(dut)
+
+    program = [
+        enc(OP_LDI, 5),
+        enc(OP_ADD, 3),
+        enc(OP_STORE, 2),
+        enc(OP_LOAD, 2),
+        enc(OP_SUB, 1),
+        enc(OP_XOR, 2),
+        enc(OP_STORE, GPIO_OUT_ADDR),
+        enc(OP_HALT),
+    ]
+
+    await run_program(
+        dut,
+        uart,
+        program
+    )
+
+    await wait_for_halt(
+        dut,
+        50
+    )
+
+    result = int(dut.uo_out.value)
+
+    assert result == 5, (
+        f"Full CPU smoke test failed: {result}"
+    )
